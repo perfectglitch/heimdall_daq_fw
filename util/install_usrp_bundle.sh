@@ -21,7 +21,12 @@
 #
 #   Target: x86_64 Linux (mirrors the reference script's scope).
 #
-set -euo pipefail
+# Deliberately no `-u`: conda's own activate/deactivate hooks (e.g. the
+# mkl blas feature's deactivate.d/libblas_mkl_deactivate.sh, sourced -- not
+# subshelled -- by `conda install`/`conda activate`) aren't nounset-safe
+# and abort under it (CONDA_MKL_INTERFACE_LAYER_BACKUP: unbound variable).
+# A well-known class of issue with conda + `set -u`, not fixable from here.
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HEIMDALL_DIR="$(dirname "$SCRIPT_DIR")"          # .../heimdall_daq_fw
