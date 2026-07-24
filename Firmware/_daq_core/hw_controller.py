@@ -43,20 +43,34 @@ class HWC():
     
     def __init__(self):                 
         
-        logging.basicConfig(level=10)
+        # Root logger stays at WARNING -- this module's own verbosity is set
+        # further down via self.logger.setLevel(self.log_level) from the ini.
+        # Setting the root logger to DEBUG here would also make third-party
+        # loggers spew unrelated verbose output.
+        logging.basicConfig(level=logging.WARNING)
         self.logger = logging.getLogger(__name__)
-        self.log_level=0 # Set from the ini file        
+        self.log_level=0 # Set from the ini file
         self.module_identifier = 6 # Inter-module message module identifier
         self.track_lock_ctr_fname = "_data_control/iq_track_lock"
         self.track_lock_ctr_fd = None
         self.in_shmem_iface = None
+        self.backend = "rtlsdr" # Overwritten from [hw] backend in the ini ("rtlsdr" | "usrp")
         # Gain index:       0  1   2   3   4   5   6    7    8    9   10   11   12   13   14   15   16   17   18   19   20   21   22   23   24   25   26   27   28
-        self.valid_gains = [0, 9, 14, 27, 37, 77, 87, 125, 144, 157, 166, 197, 207, 229, 254, 280, 297, 328, 338, 364, 372, 386, 402, 421, 434, 439, 445, 480, 496]
+        self.rtlsdr_valid_gains = [0, 9, 14, 27, 37, 77, 87, 125, 144, 157, 166, 197, 207, 229, 254, 280, 297, 328, 338, 364, 372, 386, 402, 421, 434, 439, 445, 480, 496]
         # Defined by the R820T tuner
-        
+
         self.cal_gain_table=np.array([[100,200,300,400,500,600,700,1700],[6, 10, 13, 14, 18, 22, 28, 28]]) # First column frequeny [MHz], second column gain index [valid_gains]
         self.cal_gain_table[0,:]*=10**6 # Convert to Hz
-        self.M = 7 # Number of receiver channels 
+
+        # USRP (B210) RX gain is continuous 0-76 dB (confirmed via uhd_usrp_probe
+        # on the production LibreSDR B220mini units), not R820T's discrete steps --
+        # model it as a fake "index list" in tenths of dB (0, 0.1, 0.2, .. 76.0 dB)
+        # so the rest of this module's index-based gain bookkeeping is unchanged.
+        self.usrp_valid_gains = list(range(0, 761, 10))
+        self.usrp_cal_gain_db = 30 # Overwritten from [usrp] cal_gain_db -- flat calibration gain, no R820T-style per-frequency table exists for USRP
+        self.valid_gains = self.rtlsdr_valid_gains # Selected in _read_config_file() based on self.backend
+
+        self.M = 7 # Number of receiver channels
         self.N = 2**18 # Number of samples per channel
         self.N_proc = 2**13
         self.iq_mod = None
@@ -128,7 +142,13 @@ class HWC():
             self.logger.error("DAQ core configuration file not found. Default parameters will be used!")
             return -1
         self.N = parser.getint('pre_processing', 'cpi_size')
-        self.M = parser.getint('hw', 'num_ch')                
+        self.M = parser.getint('hw', 'num_ch')
+        self.backend = parser.get('hw', 'backend', fallback='rtlsdr')
+        if self.backend == 'usrp':
+            self.valid_gains = self.usrp_valid_gains
+            self.usrp_cal_gain_db = parser.getfloat('usrp', 'cal_gain_db', fallback=30.0)
+        else:
+            self.valid_gains = self.rtlsdr_valid_gains
         self.N_proc = parser.getint('adpis', 'adpis_proc_size')
         gains_init_str=parser.get('adpis','adpis_gains_init')
         self.cal_track_mode = parser.getint('calibration','cal_track_mode')        
@@ -369,9 +389,17 @@ class HWC():
             self.last_agc = self.agc
             self.agc = False
 
+            if self.backend == 'usrp':
+                # No per-frequency characterization exists for USRP/B210 -- use a
+                # single configured calibration gain instead of cal_gain_table.
+                cal_gain_ind = min(range(len(self.usrp_valid_gains)),
+                                    key=lambda i: abs(self.usrp_valid_gains[i] - round(self.usrp_cal_gain_db * 10)))
             for m in range(self.M):
                 self.last_gains[m]=self.gains[m]
-                self.gains[m]=self.cal_gain_table[1,np.argmin(abs(self.cal_gain_table[0,:]-self.iq_header.rf_center_freq))]
+                if self.backend == 'usrp':
+                    self.gains[m]=cal_gain_ind
+                else:
+                    self.gains[m]=self.cal_gain_table[1,np.argmin(abs(self.cal_gain_table[0,:]-self.iq_header.rf_center_freq))]
             self._change_gains()
 
             self.logger.info("Enable noise source, [{:d}]".format(self.iq_header.cpi_index))

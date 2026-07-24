@@ -37,8 +37,8 @@
 #include <math.h>
 #include <string.h>
 #include <unistd.h>
-#include "rtl_daq.h"
 #include "log.h"
+#include "im_msg.h"
 #include "ini.h"
 #include "iq_header.h"
 #include "sh_mem_util.h"
@@ -55,8 +55,9 @@ typedef struct
     int cal_size;
     int cpi_size;
     int daq_buffer_size;
-    int decimation_ratio;    
-    int log_level;      
+    int decimation_ratio;
+    int log_level;
+    int sample_bit_depth; // Bits per I or Q component from the acquisition stage (8: RTL-SDR, 16: USRP)
 } configuration;
 
 /*
@@ -80,6 +81,8 @@ static int handler(void* conf_struct, const char* section, const char* name,
     {pconfig->cpi_size = atoi(value);}
     else if (MATCH("daq", "log_level"))
     {pconfig->log_level = atoi(value);}
+    else if (MATCH("daq", "sample_bit_depth"))
+    {pconfig->sample_bit_depth = atoi(value);}
     else {return 0;  /* unknown section/name, error */}
     return 0;
 }
@@ -102,9 +105,10 @@ int main(int argc, char* argv[])
     int read_size; // Used in general to store the number of succesfully read bytes
     
     // Used for the data buffering
-    int in_buffer_size, out_buffer_size, cal_out_buffer_size, active_out_buffer_size; // Interpreted in IQ samples (1 sample -> 2 uint8)
+    int in_buffer_size, out_buffer_size, cal_out_buffer_size, active_out_buffer_size; // Interpreted in IQ samples (1 sample -> 2*byte_width uint8_t)
     int buffer_num; // Size of the circular buffer (measured in input buffer size)
-    int chunk_size, chunk_size_2; // Counts uint8_t values (1 sample -> 2 uint8_t)    
+    int chunk_size, chunk_size_2; // Counts uint8_t (raw byte) values
+    int byte_width; // Bytes per I or Q component (1: RTL-SDR/8-bit, 2: USRP/16-bit)
     struct circ_buffer_struct* circ_buff_structs;
     int rd_offset=0, wr_offset=0, available=0;
     size_t offset = 0;
@@ -128,12 +132,15 @@ int main(int argc, char* argv[])
     }   
     in_buffer_size  = config.daq_buffer_size;
     out_buffer_size = config.cpi_size * config.decimation_ratio;
-    cal_out_buffer_size = config.cal_size; 
+    cal_out_buffer_size = config.cal_size;
     active_out_buffer_size = 0;
     ch_num = config.num_ch;
-    log_set_level(config.log_level);          
+    if (config.sample_bit_depth == 0) {config.sample_bit_depth = 8;} // Default for configs predating this field (RTL-SDR)
+    byte_width = config.sample_bit_depth / 8; // Bytes per I or Q component
+    log_set_level(config.log_level);
     log_info("Config succesfully loaded from %s",INI_FNAME);
     log_info("Channel number: %d", ch_num);
+    log_info("Sample bit depth: %d (byte width per component: %d)", config.sample_bit_depth, byte_width);
     log_info("Input buffer size: %d IQ samples per channel", in_buffer_size);
     log_info("Output buffer size: %d IQ samples per channel", out_buffer_size);
     log_info("Calibration buffer size: %d IQ samples per channel", cal_out_buffer_size);
@@ -149,18 +156,18 @@ int main(int argc, char* argv[])
     circ_buff_structs = malloc(ch_num*sizeof(*circ_buff_structs));
     for(int m=0;m<ch_num;m++)
     {                
-        circ_buff_structs[m].iq_circ_buffer = calloc(buffer_num * in_buffer_size*2, sizeof(uint8_t)); // *2-> I and Q
+        circ_buff_structs[m].iq_circ_buffer = calloc(buffer_num * in_buffer_size*2*byte_width, sizeof(uint8_t)); // *2-> I and Q, *byte_width -> bytes per component
     }
-    
+
     /* Initializing output shared memory interface */
     struct shmem_transfer_struct* output_sm_buff = calloc(1, sizeof(struct shmem_transfer_struct));
     if (out_buffer_size >= cal_out_buffer_size)
     {
-        output_sm_buff->shared_memory_size = out_buffer_size*ch_num*sizeof(uint8_t)*2+IQ_HEADER_LENGTH;
+        output_sm_buff->shared_memory_size = out_buffer_size*ch_num*sizeof(uint8_t)*2*byte_width+IQ_HEADER_LENGTH;
     }
     else
     {
-        output_sm_buff->shared_memory_size = cal_out_buffer_size*ch_num*sizeof(uint8_t)*2+IQ_HEADER_LENGTH;
+        output_sm_buff->shared_memory_size = cal_out_buffer_size*ch_num*sizeof(uint8_t)*2*byte_width+IQ_HEADER_LENGTH;
     }
     output_sm_buff->io_type = 0; // Output type
     output_sm_buff->drop_mode = drop_mode;
@@ -209,9 +216,9 @@ int main(int argc, char* argv[])
                 // Get the circular buffer structure of the mth channel 
                 struct circ_buffer_struct *cbuff_m = &circ_buff_structs[m];
                 
-                // Read into the buffer            
-                read_size = fread(cbuff_m->iq_circ_buffer+rd_offset, sizeof(uint8_t), (in_buffer_size*2), stdin);
-                CHK_FR_READ(read_size, in_buffer_size*2);                                                                  
+                // Read into the buffer
+                read_size = fread(cbuff_m->iq_circ_buffer+rd_offset, sizeof(uint8_t), (in_buffer_size*2*byte_width), stdin);
+                CHK_FR_READ(read_size, in_buffer_size*2*byte_width);
             }
         }
         /*
@@ -227,7 +234,7 @@ int main(int argc, char* argv[])
                 for(int m=0;m<ch_num;m++)
                 {                
                     struct circ_buffer_struct *cbuff_m = &circ_buff_structs[m];
-                    memset(circ_buff_structs[m].iq_circ_buffer, 0, buffer_num * in_buffer_size*2*sizeof(*cbuff_m->iq_circ_buffer));
+                    memset(circ_buff_structs[m].iq_circ_buffer, 0, buffer_num * in_buffer_size*2*byte_width*sizeof(*cbuff_m->iq_circ_buffer));
                 }
                 wr_offset = 0;
                 rd_offset = 0;  
@@ -238,8 +245,8 @@ int main(int argc, char* argv[])
             case FRAME_TYPE_CAL:
             {
                 // Update read offset
-                rd_offset += (in_buffer_size*2);
-                rd_offset = rd_offset%(buffer_num * in_buffer_size*2);                        
+                rd_offset += (in_buffer_size*2*byte_width);
+                rd_offset = rd_offset%(buffer_num * in_buffer_size*2*byte_width);
                 
                 // Update the available data field after succesfull read 
                 available += read_size;                
@@ -282,9 +289,9 @@ int main(int argc, char* argv[])
                     exit_flag = 1;
             }
         }
-        else if ( (iq_header->frame_type == FRAME_TYPE_CAL) & (available >= (cal_out_buffer_size*2)))
+        else if ( (iq_header->frame_type == FRAME_TYPE_CAL) & (available >= (cal_out_buffer_size*2*byte_width)))
         {active_out_buffer_size = cal_out_buffer_size;}
-        else if ( (iq_header->frame_type == FRAME_TYPE_DATA) & (available >= (out_buffer_size*2)))
+        else if ( (iq_header->frame_type == FRAME_TYPE_DATA) & (available >= (out_buffer_size*2*byte_width)))
         {active_out_buffer_size = out_buffer_size;}
         else{active_out_buffer_size=0;}
 
@@ -303,40 +310,40 @@ int main(int argc, char* argv[])
                     iq_header->cpi_length = active_out_buffer_size;
                     iq_header->adc_overdrive_flags = adc_overdrive_flags;
 
-                    float timestamp_adjust = (float) (available-active_out_buffer_size*2)/2*1000/iq_header->sampling_freq;                    
+                    float timestamp_adjust = (float) (available-active_out_buffer_size*2*byte_width)/(2*byte_width)*1000/iq_header->sampling_freq;
                     log_debug("Timestamp adjust: %f ms", timestamp_adjust);
                     iq_header->time_stamp -= (int) round(timestamp_adjust);                    
                     adc_overdrive_flags = 0;
                     memcpy(frame_ptr, iq_header,1024);
                     
                     /* Place Multichannel IQ data */
-                    chunk_size = buffer_num * in_buffer_size * 2 - wr_offset; // Available data until the end of the circular buffer                     
-                    if (chunk_size >= active_out_buffer_size*2)
+                    chunk_size = buffer_num * in_buffer_size * 2 * byte_width - wr_offset; // Available data until the end of the circular buffer
+                    if (chunk_size >= active_out_buffer_size*2*byte_width)
                     {
                         for(int m=0;m<iq_header->active_ant_chs;m++)
-                        {   
-                            // Get the circular buffer structure of the mth channel 
+                        {
+                            // Get the circular buffer structure of the mth channel
                             struct circ_buffer_struct *cbuff_m = &circ_buff_structs[m];
-                            offset = IQ_HEADER_LENGTH/(sizeof(uint8_t)) + m*active_out_buffer_size*2;
-                            memcpy(frame_ptr+offset, cbuff_m->iq_circ_buffer+wr_offset, active_out_buffer_size*2);
+                            offset = IQ_HEADER_LENGTH/(sizeof(uint8_t)) + m*active_out_buffer_size*2*byte_width;
+                            memcpy(frame_ptr+offset, cbuff_m->iq_circ_buffer+wr_offset, active_out_buffer_size*2*byte_width);
                         }
-                        wr_offset += active_out_buffer_size*2;
-                        wr_offset = wr_offset % (buffer_num * in_buffer_size*2);                    
+                        wr_offset += active_out_buffer_size*2*byte_width;
+                        wr_offset = wr_offset % (buffer_num * in_buffer_size*2*byte_width);
                     }
                     else
-                    {                
-                        chunk_size_2 = active_out_buffer_size*2-chunk_size;
+                    {
+                        chunk_size_2 = active_out_buffer_size*2*byte_width-chunk_size;
                         for(int m=0;m<iq_header->active_ant_chs;m++)
-                        {   
-                            // Get the circular buffer structure of the mth channel 
+                        {
+                            // Get the circular buffer structure of the mth channel
                             struct circ_buffer_struct *cbuff_m = &circ_buff_structs[m];
-                            offset = IQ_HEADER_LENGTH/(sizeof(uint8_t)) + m*active_out_buffer_size*2;
+                            offset = IQ_HEADER_LENGTH/(sizeof(uint8_t)) + m*active_out_buffer_size*2*byte_width;
                             memcpy(frame_ptr+offset, cbuff_m->iq_circ_buffer+wr_offset, chunk_size);
                             memcpy(frame_ptr+offset+chunk_size, cbuff_m->iq_circ_buffer, chunk_size_2);
                         }
                         wr_offset = chunk_size_2;
-                    }   
-                    available -= active_out_buffer_size*2;                
+                    }
+                    available -= active_out_buffer_size*2*byte_width;
                     send_ctr_buff_ready(output_sm_buff, active_buff_ind);                                      
                     log_trace("--> Transfering frame: type: %d, daq ind:[%d]",iq_header->frame_type, iq_header->daq_block_index);
 		    break;

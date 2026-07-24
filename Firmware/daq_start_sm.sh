@@ -22,6 +22,10 @@ sudo sysctl -w kernel.sched_rt_runtime_us=-1
 
 # Read config ini file
 out_data_iface_type=$(awk -F'=' '/out_data_iface_type/ {gsub (" ", "", $0); print $2}' daq_chain_config.ini)
+backend=$(awk -F'=' '/^backend/ {gsub (" ", "", $0); print $2}' daq_chain_config.ini)
+if [ -z "$backend" ]; then
+    backend=rtlsdr
+fi
 
 # (re) create control FIFOs
 rm _data_control/fw_decimator_in 2> /dev/null
@@ -100,8 +104,15 @@ fi
 
 # Start main program chain -Thread 0 Normal (non squelch mode)
 echo "Starting DAQ Subsystem"
-chrt -f 99 _daq_core/rtl_daq.out 2> _logs/rtl_daq.log | \
-chrt -f 99 _daq_core/rebuffer.out 0 2> _logs/rebuffer.log &
+if [ "$backend" = "usrp" ]; then
+    echo "Acquisition backend: USRP"
+    chrt -f 99 _daq_core/usrp_daq.out 2> _logs/usrp_daq.log | \
+    chrt -f 99 _daq_core/rebuffer.out 0 2> _logs/rebuffer.log &
+else
+    echo "Acquisition backend: RTL-SDR"
+    chrt -f 99 _daq_core/rtl_daq.out 2> _logs/rtl_daq.log | \
+    chrt -f 99 _daq_core/rebuffer.out 0 2> _logs/rebuffer.log &
+fi
 
 # Decimator - Thread 1
 chrt -f 99 _daq_core/decimate.out 2> _logs/decimator.log &

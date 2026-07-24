@@ -26,17 +26,18 @@
  */
  
 #include <stdio.h>
-#include <stdlib.h> 
+#include <stdlib.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
+#include <signal.h>
 
 #include "eth_server.h"
 #include "ini.h"
 #include "log.h"
 #include "sh_mem_util.h"
 #include "iq_header.h"
-#include "rtl_daq.h"
+#include "im_msg.h"
 #define INI_FNAME "daq_chain_config.ini" 
 
 #define FATAL_ERR(l) log_fatal(l); return -1;
@@ -80,23 +81,58 @@ static int handler(void* conf_struct, const char* section, const char* name,
     return 0;
 }
 
+/*
+ * send() on a TCP socket is not guaranteed to transmit the whole buffer in
+ * one call -- for large buffers (our payload can be tens of MB, well beyond
+ * the kernel's socket send buffer) it will routinely return a short count.
+ * This loops until either everything has been sent or a real error occurs,
+ * so large frames don't get silently truncated (which desyncs every frame
+ * boundary after it for the client).
+ */
+static int send_all(int socket, const void* buf, size_t len)
+{
+    const char* p = (const char*) buf;
+    size_t sent = 0;
+    while (sent < len)
+    {
+        ssize_t n = send(socket, p + sent, len - sent, MSG_NOSIGNAL);
+        if (n < 0)
+        {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        sent += (size_t) n;
+    }
+    return 0;
+}
+
 int send_iq_frame(struct iq_frame_struct_32* iq_frame, int socket)
 {
-    int transfer_size =iq_frame->payload_size*sizeof(*iq_frame->payload)*2+IQ_HEADER_LENGTH;
-	
-	// Sending header
-	int size = send(socket, iq_frame->header, sizeof(struct iq_header_struct), 0);
-	// Sending payload
-	if (iq_frame->payload_size !=0){
-		size += send(socket, iq_frame->payload, transfer_size-IQ_HEADER_LENGTH, 0);}
-	// Check transfer
-	if(size != transfer_size){log_error("Ethernet transfer failed"); return -1;}	
-	//usleep(50000); // In some cases it is required to fully finish the sending from OS buffers
-	return 0;
+    int transfer_size = iq_frame->payload_size*sizeof(*iq_frame->payload)*2+IQ_HEADER_LENGTH;
+
+    // Sending header
+    if (send_all(socket, iq_frame->header, sizeof(struct iq_header_struct)) != 0)
+    {log_error("Ethernet transfer failed (header)"); return -1;}
+    // Sending payload
+    if (iq_frame->payload_size != 0)
+    {
+        if (send_all(socket, iq_frame->payload, transfer_size-IQ_HEADER_LENGTH) != 0)
+        {log_error("Ethernet transfer failed (payload)"); return -1;}
+    }
+    return 0;
 }
 
 int main(int argc, char* argv[])
 {
+    // A client (e.g. a GNU Radio flowgraph) disconnecting mid-transfer is
+    // routine, not exceptional -- without this, the next send() on the now-
+    // closed socket raises SIGPIPE, whose default action silently kills this
+    // whole process (cascading into a broken-pipe crash in delay_sync.py,
+    // which writes to this process via a control FIFO). MSG_NOSIGNAL on the
+    // send() call in send_all() covers the socket specifically; this is
+    // defense in depth for any other write path.
+    signal(SIGPIPE, SIG_IGN);
+
     log_set_level(LOG_TRACE);
     configuration config;
 	int ret = 0;

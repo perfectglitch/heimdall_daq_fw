@@ -65,16 +65,43 @@ def get_serials():
                 serial_nos.append(int(line[line.find(':\t\t')+2:]))
     return serial_nos
 
+def get_usrp_serials():
+    """
+    Returns the list of serial numbers of the currently UHD-discoverable USRPs,
+    by parsing `uhd_find_devices` output (one "serial: XXXXXXX" line per device).
+    """
+    serial_nos = []
+    try:
+        uhd_find_cmd = subprocess.run(["uhd_find_devices"], capture_output=True, text=True, timeout=15)
+        for line in uhd_find_cmd.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("serial:"):
+                serial_nos.append(line.split(":", 1)[1].strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        logging.warning("uhd_find_devices could not be run, assuming no USRPs are discoverable")
+    return serial_nos
+
 # Initialize logger
 logging.basicConfig(level=logging.ERROR)
 valid_bias_enable_flag = [0, 1]
 valid_gains = [0, 9, 14, 27, 37, 77, 87, 125, 144, 157, 166, 197, 207, 229, 254, 280, 297, 328, 338, 364, 372, 386, 402, 421, 434, 439, 445, 480, 496]
-valid_fir_windows = ['boxcar', 'triang', 'blackman', 'hamming', 'hann', 'bartlett', 'flattop', 'parzen' , 'bohman', 'blackmanharris', 'nuttall', 'barthann'] 
+# USRP (B210) RX gain is continuous 0-76 dB (confirmed via uhd_usrp_probe on the
+# production LibreSDR B220mini units), tenths of dB to match the ini's units
+# (e.g. daq.gain=300 -> 30.0 dB)
+usrp_valid_gain_range = (0, 760)
+valid_fir_windows = ['boxcar', 'triang', 'blackman', 'hamming', 'hann', 'bartlett', 'flattop', 'parzen' , 'bohman', 'blackmanharris', 'nuttall', 'barthann']
 # See: https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.get_window.html#scipy.signal.get_window
 
 def check_ini(parameters, en_hw_check=True):
-    device_count = count_receivers()
-    serials = get_serials() if en_hw_check else []
+    hw_params = parameters['hw']
+    backend = hw_params.get('backend', 'rtlsdr')
+
+    if backend == 'usrp':
+        device_count = int(hw_params['num_ch']) if chk_int(hw_params.get('num_ch', '')) else 0
+        usrp_serials = get_usrp_serials() if en_hw_check else []
+    else:
+        device_count = count_receivers()
+        serials = get_serials() if en_hw_check else []
 
     error_list = []
     """
@@ -83,7 +110,6 @@ def check_ini(parameters, en_hw_check=True):
     --------------------------------
     """
 
-    hw_params = parameters['hw']
     if len(hw_params['name']) > 16:
         error_list.append("Hardware name has to be less than 16 character, currently it is: {:d}".format(len(hw_params['name'])))
 
@@ -102,16 +128,17 @@ def check_ini(parameters, en_hw_check=True):
             error_list.append("Only {0} receiver channels are available, but {1} is requested!".format(device_count, hw_params['num_ch']))
         else:
             device_count = int(hw_params['num_ch'])
-    bias_init_str = hw_params['en_bias_tee']
-    bias_init_str = bias_init_str.split(',')
-    for bias_en_str in bias_init_str:
-        if not chk_int(bias_en_str):
-            error_list.append("Bias tee init value must be a list of integers, Currently it is: '{0}' ".format(bias_en_str))
-        else:
-            if not int(bias_en_str) in valid_bias_enable_flag:
-                error_list.append("Bias tee init values should be one of the followings:{0}. Currently one of it is: '{1}' ".format(valid_bias_enable_flag,int(bias_en_str)))
-    if en_hw_check and len(bias_init_str) != device_count:
-        error_list.append("The number of specified bias tee init values does not much with availble channels. Set:{0}, available:{1}".format(len(bias_init_str), device_count))
+    if backend != 'usrp': # en_bias_tee is an RTL-SDR-only field, not present in USRP configs
+        bias_init_str = hw_params['en_bias_tee']
+        bias_init_str = bias_init_str.split(',')
+        for bias_en_str in bias_init_str:
+            if not chk_int(bias_en_str):
+                error_list.append("Bias tee init value must be a list of integers, Currently it is: '{0}' ".format(bias_en_str))
+            else:
+                if not int(bias_en_str) in valid_bias_enable_flag:
+                    error_list.append("Bias tee init values should be one of the followings:{0}. Currently one of it is: '{1}' ".format(valid_bias_enable_flag,int(bias_en_str)))
+        if en_hw_check and len(bias_init_str) != device_count:
+            error_list.append("The number of specified bias tee init values does not much with availble channels. Set:{0}, available:{1}".format(len(bias_init_str), device_count))
 
     """
     --------------------------------
@@ -151,8 +178,12 @@ def check_ini(parameters, en_hw_check=True):
     if not chk_int(daq_params['gain']):
         error_list.append("Gain must be a non-zero integer. Currently it is: '{0}' ".format(daq_params['gain']))
     else:
-        if not int(daq_params['gain']) in valid_gains:
-            error_list.append("The gain value should be one of the followings:{0}. Currently it is: '{1}' ".format(valid_gains, daq_params['gain']))
+        if backend == 'usrp':
+            if not (usrp_valid_gain_range[0] <= int(daq_params['gain']) <= usrp_valid_gain_range[1]):
+                error_list.append("The gain value should be in the range {0} (tenths of dB). Currently it is: '{1}' ".format(usrp_valid_gain_range, daq_params['gain']))
+        else:
+            if not int(daq_params['gain']) in valid_gains:
+                error_list.append("The gain value should be one of the followings:{0}. Currently it is: '{1}' ".format(valid_gains, daq_params['gain']))
 
     if not chk_int(daq_params['en_noise_source_ctr']):
         error_list.append("Noise source control enable must be 0 or 1. Currently it is: '{0}' ".format(daq_params['en_noise_source_ctr']))
@@ -160,11 +191,44 @@ def check_ini(parameters, en_hw_check=True):
         if not int(daq_params['en_noise_source_ctr']) in [0,1]:
             error_list.append("Noise source control enable must be 0 or 1. Currently it is: '{0}' ".format(daq_params['en_noise_source_ctr']))
 
-    if not chk_int(daq_params['ctr_channel_serial_no']):
-        error_list.append("Control channel serial number must be an integer. Currently it is: '{0}' ".format(daq_params['ctr_channel_serial_no']))
+    if backend != 'usrp': # ctr_channel_serial_no (RTL-SDR bias-tee control channel) is not applicable to USRP configs
+        if not chk_int(daq_params['ctr_channel_serial_no']):
+            error_list.append("Control channel serial number must be an integer. Currently it is: '{0}' ".format(daq_params['ctr_channel_serial_no']))
+        else:
+            if en_hw_check and not int(daq_params['ctr_channel_serial_no']) in serials:
+                error_list.append("Invalid control channel serial number. Available serial numbers: {0}, Currrently set:{1}".format(serials, daq_params['ctr_channel_serial_no']))
     else:
-        if en_hw_check and not int(daq_params['ctr_channel_serial_no']) in serials:
-            error_list.append("Invalid control channel serial number. Available serial numbers: {0}, Currrently set:{1}".format(serials, daq_params['ctr_channel_serial_no']))
+        usrp_params = parameters.get('usrp', {})
+        noise_params = parameters.get('noise_source', {})
+
+        num_ch_devs = []
+        for slot in range(3):
+            serial_key = 'serial_{0}'.format(slot)
+            numch_key = 'num_ch_{0}'.format(slot)
+            if not chk_int(usrp_params.get(numch_key, '')):
+                error_list.append("[usrp] {0} must be an integer. Currently it is: '{1}' ".format(numch_key, usrp_params.get(numch_key)))
+                continue
+            num_ch = int(usrp_params[numch_key])
+            valid_range = (1, 2) if slot == 0 else (0, 2)
+            if not (valid_range[0] <= num_ch <= valid_range[1]):
+                error_list.append("[usrp] {0} must be in range {1}. Currently it is: '{2}' ".format(numch_key, valid_range, num_ch))
+            num_ch_devs.append(num_ch)
+            if num_ch > 0:
+                serial = usrp_params.get(serial_key, '')
+                if not serial:
+                    error_list.append("[usrp] {0} must be set when {1} > 0".format(serial_key, numch_key))
+                elif en_hw_check and serial not in usrp_serials:
+                    error_list.append("[usrp] {0}='{1}' was not found by uhd_find_devices. Discovered serials: {2}".format(serial_key, serial, usrp_serials))
+
+        if chk_int(hw_params.get('num_ch', '')) and sum(num_ch_devs) != int(hw_params['num_ch']):
+            error_list.append("[usrp] num_ch_0/1/2 must sum to [hw] num_ch ({0}). Currently sum to: {1}".format(hw_params['num_ch'], sum(num_ch_devs)))
+
+        if not chk_int(noise_params.get('tx_sample_rate', '')) or int(noise_params.get('tx_sample_rate', 0)) <= 0:
+            error_list.append("[noise_source] tx_sample_rate must be a positive integer. Currently it is: '{0}' ".format(noise_params.get('tx_sample_rate')))
+        if not chk_float(noise_params.get('tx_gain_db', '')) or not (0 <= float(noise_params.get('tx_gain_db', -1)) <= 47):
+            error_list.append("[noise_source] tx_gain_db must be a float in range 0-47. Currently it is: '{0}' ".format(noise_params.get('tx_gain_db')))
+        if not chk_int(noise_params.get('amp_enable', '')) or int(noise_params.get('amp_enable', -1)) not in [0,1]:
+            error_list.append("[noise_source] amp_enable must be 0 or 1. Currently it is: '{0}' ".format(noise_params.get('amp_enable')))
 
     """
     --------------------------------------
@@ -358,6 +422,9 @@ def check_ini(parameters, en_hw_check=True):
     for gain_str in gains_init_str:
         if not chk_int(gain_str):
             error_list.append("ADPIS gain init value must be a list of integers, Currently it is: '{0}' ".format(gains_init_str))
+        elif backend == 'usrp':
+            if not (usrp_valid_gain_range[0] <= int(gain_str) <= usrp_valid_gain_range[1]):
+                error_list.append("ADPIS gain init values should be in range {0} (tenths of dB). Currently one of it is: '{1}' ".format(usrp_valid_gain_range,int(gain_str)))
         else:
             if not int(gain_str) in valid_gains:
                 error_list.append("ADPIS gain init values should be one of the followings:{0}. Currently one of it is: '{1}' ".format(valid_gains,int(gain_str)))

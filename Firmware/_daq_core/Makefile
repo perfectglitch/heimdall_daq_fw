@@ -2,6 +2,12 @@
 # Author: Tamás Pető, Sándor Bajusz
 CC=gcc
 CFLAGS=-Wall -std=gnu99 -march=native -O2 -I.
+CXX=g++
+CXXFLAGS=-Wall -std=c++17 -march=native -O2 -I.
+UHD_CFLAGS=$(shell pkg-config --cflags uhd)
+UHD_LIBS=$(shell pkg-config --libs uhd)
+HACKRF_CFLAGS=$(shell pkg-config --cflags libhackrf)
+HACKRF_LIBS=$(shell pkg-config --libs libhackrf)
 
 # Optimized C-flags for Pi 4
 #CFLAGS=-Wall -std=gnu99 -mcpu=cortex-a72 -mtune=cortex-a72 -Ofast -funsafe-math-optimizations -funroll-loops
@@ -21,6 +27,11 @@ else
 decimator: decimate_arm_neon
 endif
 
+# USRP + HackRF acquisition path, built separately from `all` so that plain
+# `make`/`make all` doesn't newly require libuhd-dev/libhackrf-dev for
+# existing RTL-SDR/KrakenSDR-only builds.
+usrp: daq_util usrp_daq rebuffer iq_server decimator
+
 daq_util:
 	$(CC) $(CFLAGS) -c -o ini.o ini.c
 	$(CC) $(CFLAGS) -c -o log.o log.c
@@ -29,6 +40,10 @@ daq_util:
 
 rtl_daq: iq_header.c log.c ini.c rtl_daq.c rtl_daq.h
 	$(CC) $(CFLAGS) log.o ini.o iq_header.o -o rtl_daq.out rtl_daq.c -lpthread -lzmq $(PIGPIO) -L. -lrtlsdr -lusb-1.0
+
+usrp_daq: iq_header.c log.c ini.c usrp_daq.cc im_msg.h
+	$(CXX) $(CXXFLAGS) $(UHD_CFLAGS) $(HACKRF_CFLAGS) -c usrp_daq.cc -o usrp_daq.o
+	$(CXX) $(CXXFLAGS) log.o ini.o iq_header.o usrp_daq.o -o usrp_daq.out -lpthread -lzmq $(UHD_LIBS) $(HACKRF_LIBS)
 
 rebuffer: sh_mem_util.c iq_header.c log.c ini.c rebuffer.c rtl_daq.h
 	$(CC) $(CFLAGS) sh_mem_util.o log.o ini.o iq_header.o -o rebuffer.out rebuffer.c -lrt -lm
@@ -45,5 +60,5 @@ iq_server: sh_mem_util.c iq_header.c log.c ini.c iq_server.c
 	$(CC) $(CFLAGS) sh_mem_util.o log.o ini.o iq_header.o -o iq_server.out iq_server.c -lrt
 
 clean:
-	$(RM) ini.o log.o iq_header.o sh_mem_util.o fir_decimate.o decimate.o rtl_daq.out rebuffer.out decimate.out iq_server.out 	
+	$(RM) ini.o log.o iq_header.o sh_mem_util.o fir_decimate.o decimate.o usrp_daq.o rtl_daq.out usrp_daq.out rebuffer.out decimate.out iq_server.out
 

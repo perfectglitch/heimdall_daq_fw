@@ -43,9 +43,13 @@
 unsigned char char_init_ready[1]={INIT_READY}; 
 unsigned char char_a_buff_ready[1]={A_BUFF_READY}; 
 unsigned char char_b_buff_ready[1]={B_BUFF_READY}; 
-unsigned char char_terminate[1]={TERMINATE}; 
+unsigned char char_terminate[1]={TERMINATE};
 
-uint8_t signal;
+// static: a non-static global here previously shadowed libc's signal()
+// function at link time (any binary linking this .o that also called
+// signal() would silently jump into this variable's memory instead and
+// crash) -- iq_server.c's SIGPIPE handling is what exposed it.
+static uint8_t signal;
 
 void send_ctr_init_ready(struct shmem_transfer_struct* sm_buff)
 {       

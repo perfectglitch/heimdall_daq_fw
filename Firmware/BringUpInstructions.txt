@@ -73,3 +73,52 @@
 
 #7  Install ZMQ
     sudo apt install libzmq3-dev -y
+
+#8. USRP + HackRF acquisition path (in place of RTL-SDR/KrakenSDR)
+    #
+    # This replaces steps 2-3-4 above (no RTL-SDR/Ne10/KFR dependency for this
+    # path) with a UHD + libhackrf based build. Production hardware is 3x
+    # USRP B210-class devices (2+2+1 = 5 coherent RX channels, the third unit
+    # has only one antenna connected) plus a HackRF One used as an external
+    # noise source for amplitude/phase calibration.
+    #
+    #-> Install UHD (Ettus Research USRP Hardware Driver) and libhackrf dev packages
+    sudo apt-get install libuhd-dev uhd-host libhackrf-dev
+    sudo uhd_images_downloader   # fetches stock FPGA/firmware images
+    #   If your USRPs are LibreSDR B220mini clones (not genuine Ettus B210s),
+    #   they may need vendor-specific FPGA/firmware images instead of the
+    #   stock ones -- see the fpga_path/fw_path fields in [usrp] below.
+
+    #-> Build only the USRP acquisition binary + the rest of the chain
+    cd Firmware/_daq_core
+    make usrp
+    # (plain `make`/`make all` still only builds the RTL-SDR path and does
+    #  not require libuhd-dev/libhackrf-dev)
+
+    #-> Config
+    # Use config_files/usrp_default/daq_chain_config.ini as a starting point
+    # (or edit the active Firmware/daq_chain_config.ini directly, which
+    # already defaults to this hardware). Key fields to fill in for your
+    # specific units:
+    #   [hw]   backend = usrp
+    #   [usrp] serial_0/1/2, num_ch_0/1/2  -- get serials via `uhd_find_devices`
+    #          fpga_path/fw_path           -- only needed for non-stock images
+    #   [noise_source] hackrf_serial       -- get via `hackrf_info` (blank = auto-detect single device)
+    #
+    # Clock/PPS: USRP 0 (serial_0) acts as the PPS master -- its GPIO PPS
+    # output must be wired to the external PPS input of USRPs 1 and 2, which
+    # are configured as PPS slaves (time_source=external). This mirrors the
+    # architecture in Firmware/usrp/coherent_usrp_source_impl.cc.
+    #
+    # Calibration / noise source: the HackRF transmits synthesized broadband
+    # noise (see usrp_daq.cc's built-in noise generator) when the DAQ chain's
+    # noise-source control ('n' command / hw_controller.py's calibration FSM)
+    # requests it -- exactly the same control path RTL-SDR's bias-tee diode
+    # used, just driving a HackRF TX start/stop instead of a GPIO. An external
+    # RF switch automatically feeds the HackRF's TX signal into all 3 USRPs
+    # whenever HackRF TX is active, and passes the antennas through
+    # otherwise -- there is no software switch/GPIO control for this, it's a
+    # property of the external hardware.
+    #
+    # Run with: ./daq_start_sm.sh  (same script; it reads [hw] backend from
+    # the ini to decide whether to launch usrp_daq.out or rtl_daq.out)

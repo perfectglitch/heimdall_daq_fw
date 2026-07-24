@@ -38,7 +38,8 @@ from scipy import fft
 from scipy.optimize import curve_fit
 from configparser import ConfigParser
 import zmq
-import skrf as rf
+# skrf is only needed for iq_adjust_source="touchstone" (see below) -- imported
+# lazily there so the "explicit-time-delay" path doesn't require it installed.
 
 import numba as nb
 from numba import jit, njit
@@ -56,7 +57,13 @@ class delaySynchronizer():
     
     def __init__(self):
         
-        logging.basicConfig(level=10)
+        # Root logger stays at WARNING -- this module's own verbosity is set
+        # further down via self.logger.setLevel(self.log_level) from the ini.
+        # Setting the root logger to DEBUG here would also make third-party
+        # loggers (e.g. numba's JIT compiler tracing) spew massive verbose
+        # output on every @njit compilation, which can turn a few seconds of
+        # first-run JIT compilation into many minutes.
+        logging.basicConfig(level=logging.WARNING)
         self.logger = logging.getLogger(__name__)
 
         self.module_identifier = 5 # Inter-module message module identifier        
@@ -93,7 +100,24 @@ class delaySynchronizer():
 
         self.phase_diff_tolerance = 3 # deg, maximum allowable phase difference
         self.amp_diff_tolerance = 0.5 # power ratio  maximum allowable amplitude difference, not dB!
-        self.frac_delay_tolerance = 0.03
+        # 0.03 assumed RTL-SDR-style independent free-running channels. USRP
+        # channel/device pairs have a small, fixed (not drifting) skew
+        # inherent to the AD9361 RFIC's digital front-end and PPS-lock
+        # characteristics (confirmed ~0.12-0.4 samples across channels on
+        # the production hardware) -- a real phase characteristic for
+        # STATE_IQ_CAL to absorb, not a timing error usrp_daq.cc's
+        # integer-sample skip correction can zero out (it only acts on
+        # STATE_SAMPLE_CAL's >=1-sample corrections, deliberately not this
+        # stage's sub-sample ones -- a 1-sample skip would overshoot a <1
+        # sample target every time). 0.03 would block convergence permanently.
+        # 0.45 itself proved too tight on a later power-cycle: the
+        # per-power-cycle-random AD9361 phase state landed at 0.456/0.458 on
+        # two channels, just outside the observed 0.12-0.4 range, and since
+        # usrp_daq.cc has no mechanism to correct sub-sample delay at all
+        # (see its 's' handler), there was nothing to shrink that residual --
+        # it deadlocked in STATE_FRAC_SAMPLE_CAL/STATE_FRAC_SYNC_WAIT forever.
+        # Widened the margin a bit further.
+        self.frac_delay_tolerance = 0.5
         self.sync_failed_cntr = 0 # Counts the number of iq or sample sync fails in track mode
         self.max_sync_fails = 3 # Maximum number of synchronization fails before the sync track is lost
         self.sync_failed_cntr_total = 0
@@ -202,6 +226,7 @@ class delaySynchronizer():
             self.iq_adjust = self.iq_adjust_amplitude * np.exp(1j*iq_adjust_phase) # Assemble IQ adjustment vector
             self.iq_adjust = np.insert(self.iq_adjust, self.std_ch_ind, 1+0j)
         elif self.iq_adjust_source == "touchstone":
+            import skrf as rf
             for m in range(self.M):
                 fname = join("_calibration", f"cable_ch{m}.s1p")
                 self.logger.info(f"Loading: {fname}")

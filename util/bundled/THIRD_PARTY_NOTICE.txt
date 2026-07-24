@@ -1,0 +1,32 @@
+FPGA/firmware binaries in this directory
+==========================================
+
+  libresdr_b210.bin   -- FPGA image -- MODIFIED
+  usrp_b200_fw.hex    -- USB firmware image -- STOCK (unmodified)
+
+Neither is part of HeIMDALL DAQ Firmware's own source, and neither is
+covered by this repository's GPLv3 LICENSE.
+
+libresdr_b210.bin: NOT a stock vendor image. The LibreSDR B220mini units
+used with this fork have modifications of their own relative to stock
+LibreSDR B220mini units, and this FPGA image has been modified by en7
+to work with that modified hardware. It will not necessarily work on
+unmodified LibreSDR/B210 hardware, and an unmodified stock FPGA image
+will not necessarily work on this hardware. Its license depends on
+whatever base image it was modified from (not specified here).
+
+usrp_b200_fw.hex: stock, unmodified USB firmware from Ettus Research --
+the same image UHD's own `uhd_images_downloader` would normally fetch
+for a USRP B200-series device. Included here only for convenience/
+offline install; not modified by this project.
+
+They are loaded via UHD's fpga_path/fw_path device args (see [usrp] in
+daq_chain_config.ini). If you are redistributing this repository (or a
+bundle built from util/install_usrp_bundle.sh) to others, confirm you
+have the right to redistribute libresdr_b210.bin in particular before
+doing so, or omit it and have recipients modify their own base image for
+their own hardware instead.
+
+Genuine, unmodified Ettus B210 users don't need either of these files --
+use `uhd_images_downloader` (see Firmware/BringUpInstructions.txt,
+step #8) to fetch the stock Ettus-signed images instead.

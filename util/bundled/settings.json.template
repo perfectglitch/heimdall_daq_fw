@@ -1,0 +1,9 @@
+{
+  "data_interface": "eth",
+  "default_ip": "127.0.0.1",
+  "center_freq": 868.0,
+  "uniform_gain": 30,
+  "ant_arrangement": "ULA",
+  "ant_spacing_meters": 0.15,
+  "doa_method": "MUSIC"
+}
