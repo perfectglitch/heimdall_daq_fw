@@ -45,7 +45,6 @@ for f in \
     "Firmware/_daq_core/im_msg.h" \
     "util/bundled/libresdr_b210.bin" \
     "util/bundled/usrp_b200_fw.hex" \
-    "Firmware/usrp/coherent_usrp_source_impl.cc" \
     "config_files/usrp_default/daq_chain_config.ini"
 do
     if [ ! -e "$HEIMDALL_DIR/$f" ]; then
@@ -83,6 +82,28 @@ sudo apt -y install \
 # "../util/bundled/...") -- uhd_images_downloader is here for completeness /
 # genuine Ettus B210 users, not required for the vendored-image path.
 uhd_images_downloader || echo "WARN: uhd_images_downloader failed/skipped -- fine if using the vendored LibreSDR images"
+
+#############################################
+# 1a. KFR DSP library -- x86_64's SIMD FIR filter backend for the
+#     `decimator` target pulled in by `make usrp` below (fir_decimate.c
+#     #includes kfr/capi.h and links -lkfr_capi; nothing apt-installs this).
+#############################################
+if [ ! -f /usr/include/kfr/capi.h ]; then
+    KFR_BUILD_DIR="$(mktemp -d)"
+    git clone https://github.com/krakenrf/kfr "$KFR_BUILD_DIR/kfr"
+    mkdir "$KFR_BUILD_DIR/kfr/build"
+    cd "$KFR_BUILD_DIR/kfr/build"
+    cmake -DENABLE_CAPI_BUILD=ON -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release ..
+    make
+    sudo cp lib/* /usr/local/lib
+    sudo mkdir -p /usr/include/kfr
+    sudo cp ../include/kfr/capi.h /usr/include/kfr
+    sudo ldconfig
+    cd "$HEIMDALL_DIR"
+    rm -rf "$KFR_BUILD_DIR"
+else
+    echo "KFR already installed at /usr/include/kfr/capi.h, skipping"
+fi
 
 #############################################
 # 2. Build the USRP DAQ backend

@@ -379,6 +379,12 @@ def check_ini(parameters, en_hw_check=True):
         if int(cal_params['maximum_sync_fails']) < 1:
             error_list.append("Maximum allowed sync check fails must be a positive integer. Currently it is: '{0}' ".format(cal_params['maximum_sync_fails']))
 
+    if not chk_float(cal_params['frac_cal_timeout_s']):
+        error_list.append("Fractional sample delay calibration timeout must be a positive number. Currently it is: '{0}' ".format(cal_params['frac_cal_timeout_s']))
+    else:
+        if float(cal_params['frac_cal_timeout_s']) <= 0:
+            error_list.append("Fractional sample delay calibration timeout must be a positive number. Currently it is: '{0}' ".format(cal_params['frac_cal_timeout_s']))
+
     iq_adjust_amplitude_str = cal_params['iq_adjust_amplitude']
     iq_adjust_amplitude_str = iq_adjust_amplitude_str.split(',')
     iq_adjust_time_delay_str     = cal_params['iq_adjust_time_delay_ns']

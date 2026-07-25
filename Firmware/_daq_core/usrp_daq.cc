@@ -359,6 +359,47 @@ static int noise_source_state = 0;
 static int last_noise_source_state = 0;
 
 /*
+ * Wire protocol (hdaq_im_msg_struct, matching rtl_daq.c) always carries gain
+ * as tenths of dB -- hw_controller.py resolves its RTL-SDR-shaped, index-into-
+ * a-discrete-table gain model down to that real value before sending, using
+ * self.usrp_valid_gains (see hw_controller.py) when the backend is USRP. So
+ * unlike rtl_daq.c, which hands the value straight to rtlsdr_set_tuner_gain()
+ * (itself snapping to the nearest of a fixed discrete step table), this side
+ * never needs a lookup table of its own -- UHD's set_rx_gain() takes a plain
+ * continuous dB value.
+ *
+ * What it does still need: RTL-SDR's driver silently snaps out-of-range
+ * requests to the nearest supported step and reports what it *actually*
+ * applied; UHD's set_rx_gain() gives no such feedback and silently clips to
+ * the daughterboard's real gain range (not necessarily the 0-76dB assumed by
+ * ini_checker.py/hw_controller.py's usrp_valid_gain_range -- that's only
+ * confirmed for the specific B210 units this was tested against). Without a
+ * readback, a clipped request would get echoed into if_gains as if it had
+ * been applied verbatim, silently breaking any calibration logic downstream
+ * (e.g. hw_controller.py's gain-consistency check at STATE_GAIN_CTR_WAIT)
+ * that trusts if_gains to reflect the real hardware state.
+ */
+static int apply_rx_gain(usrp_dev_struct& dev, int chan, int gain_tenths_db)
+{
+    double requested_db = gain_tenths_db / 10.0;
+    uhd::gain_range_t range = dev.usrp->get_rx_gain_range(chan);
+    double clamped_db = requested_db;
+    if (clamped_db < range.start()) clamped_db = range.start();
+    if (clamped_db > range.stop()) clamped_db = range.stop();
+    if (clamped_db != requested_db)
+        log_warn("USRP %d ch %d: requested gain %.1f dB outside device range [%.1f, %.1f] dB, clamping to %.1f dB",
+                 dev.slot, chan, requested_db, range.start(), range.stop(), clamped_db);
+
+    dev.usrp->set_rx_gain(clamped_db, chan);
+
+    double actual_db = dev.usrp->get_rx_gain(chan);
+    if (std::fabs(actual_db - clamped_db) > 0.05)
+        log_warn("USRP %d ch %d: gain set to %.1f dB but device reports %.1f dB", dev.slot, chan, clamped_db, actual_db);
+
+    return (int) std::lround(actual_db * 10.0);
+}
+
+/*
  *===========================================================================
  *  Device open / PPS sync
  *===========================================================================
@@ -405,7 +446,7 @@ static bool open_and_sync_devices()
         for (int c = 0; c < dev.num_ch; c++)
         {
             dev.usrp->set_rx_freq(uhd::tune_request_t((double) config.center_freq), c);
-            dev.usrp->set_rx_gain((double) config.gain / 10.0, c);
+            channel_gain[dev.ch_offset + c] = apply_rx_gain(dev, c, config.gain);
             dev.usrp->set_rx_antenna(config.antenna, c);
         }
     }
@@ -986,8 +1027,7 @@ int main(int argc, char** argv)
                 for (int c = 0; c < dev.num_ch; c++)
                 {
                     int flat_ch = dev.ch_offset + c;
-                    dev.usrp->set_rx_gain((double) local_new_gains[flat_ch] / 10.0, c);
-                    channel_gain[flat_ch] = local_new_gains[flat_ch];
+                    channel_gain[flat_ch] = apply_rx_gain(dev, c, local_new_gains[flat_ch]);
                 }
             }
         }

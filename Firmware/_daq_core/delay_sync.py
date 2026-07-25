@@ -28,7 +28,7 @@ import logging
 from ntpath import join
 import sys
 from struct import pack
-from time import sleep
+from time import sleep, monotonic
 from os.path import join
 
 # Import third-party modules
@@ -98,7 +98,7 @@ class delaySynchronizer():
         self.cal_track_mode = 0        
         self.amplitude_cal_mode = "channel_power" # "default" / "disabled" / "channel_power"  -> Updated from .ini
 
-        self.phase_diff_tolerance = 3 # deg, maximum allowable phase difference
+        self.phase_diff_tolerance = 1 # deg, maximum allowable phase difference
         self.amp_diff_tolerance = 0.5 # power ratio  maximum allowable amplitude difference, not dB!
         # 0.03 assumed RTL-SDR-style independent free-running channels. USRP
         # channel/device pairs have a small, fixed (not drifting) skew
@@ -118,6 +118,19 @@ class delaySynchronizer():
         # it deadlocked in STATE_FRAC_SAMPLE_CAL/STATE_FRAC_SYNC_WAIT forever.
         # Widened the margin a bit further.
         self.frac_delay_tolerance = 0.5
+        # Wall-clock deadline for a single STATE_FRAC_SAMPLE_CAL attempt (started
+        # when STATE_SAMPLE_CAL first hands off to it, and NOT reset across the
+        # STATE_FRAC_SAMPLE_CAL/STATE_FRAC_SYNC_WAIT retry loop, so it bounds the
+        # whole attempt, not each retry). The residual sub-sample skew above is a
+        # fixed-but-random-per-power-cycle AD9361 characteristic, not a drift --
+        # so if it hasn't converged below frac_delay_tolerance within this many
+        # seconds, keeping the ppm-tuning loop running longer won't help either.
+        # On timeout the calibrator just accepts whatever residual is left and
+        # proceeds to STATE_IQ_CAL, the same as a normal convergence -- this is
+        # a deliberate give-up, not a sync failure, so it does NOT feed into
+        # sync_failed_cntr/max_sync_fails or force a STATE_INIT restart.
+        self.frac_cal_start_time = None
+        self.frac_cal_timeout_s = 10 # sec -> Updated from .ini
         self.sync_failed_cntr = 0 # Counts the number of iq or sample sync fails in track mode
         self.max_sync_fails = 3 # Maximum number of synchronization fails before the sync track is lost
         self.sync_failed_cntr_total = 0
@@ -192,6 +205,7 @@ class delaySynchronizer():
         self.std_ch_ind = parser.getint('calibration','std_ch_ind')
         self.amp_diff_tolerance = parser.getint('calibration', 'amplitude_tolerance')
         self.phase_diff_tolerance = parser.getint('calibration', 'phase_tolerance')
+        self.frac_cal_timeout_s = parser.getfloat('calibration', 'frac_cal_timeout_s')
         self.cal_track_mode = parser.getint('calibration','cal_track_mode')
         self.max_sync_fails = parser.getint('calibration','maximum_sync_fails')
         self.amplitude_cal_mode = parser.get('calibration','amplitude_cal_mode')
@@ -602,8 +616,9 @@ class delaySynchronizer():
                         self.current_state = "STATE_SYNC_WAIT"
                         
                     if sample_sync_flag:
-                        self.sample_compensation_cntr+=1 # Used to track how many succesfull compenssation have been performed so far 
-                        self.current_state = "STATE_FRAC_SAMPLE_CAL"  
+                        self.sample_compensation_cntr+=1 # Used to track how many succesfull compenssation have been performed so far
+                        self.current_state = "STATE_FRAC_SAMPLE_CAL"
+                        self.frac_cal_start_time = monotonic() # Start the give-up timer for this attempt
                 #
                 #------------------------------------------>
                 #
@@ -622,26 +637,39 @@ class delaySynchronizer():
                     # Calculate fractional delays
                     taus = self.estimate_frac_delays(iq_samples[0:self.N_proc])
                     self.logger.debug(f"Fractional delays: {taus}")
-                    
-                    # Determine and set tune values
-                    frac_delay_update_flag = False
-                    fs_ppm_offsets=[0]*self.M 
-                    
-                    for m in range(self.M-1):
-                        if abs(taus[m]) > self.frac_delay_tolerance:
-                            fs_ppm_offsets[m+1] = np.sign(taus[m]) * np.abs(taus[m] * self.FRAC_FS_TUNE_GAIN) * self.MIN_FS_PPM_OFFSET
-                            frac_delay_update_flag = True
-                    
-                    if frac_delay_update_flag:
-                        self.logger.debug(f"Sending ppm offsets: {fs_ppm_offsets}")
-                        msg_byte_array = inter_module_messages.pack_msg_sample_freq_tune(self.module_identifier, fs_ppm_offsets)
-                        self.rtl_daq_socket.send(msg_byte_array)
-                        reply = self.rtl_daq_socket.recv()
-                        self.logger.debug(f"Received reply: {reply}")
-                        self.last_update_ind=self.iq_header.cpi_index
-                        self.current_state = "STATE_FRAC_SYNC_WAIT"
-                    else:
+
+                    if monotonic() - self.frac_cal_start_time > self.frac_cal_timeout_s:
+                        # Give up: the residual is a fixed per-power-cycle AD9361
+                        # characteristic (see frac_delay_tolerance's comment above),
+                        # not a drift, so further retries are equally unlikely to
+                        # converge. Accept the current residual and move on instead
+                        # of deadlocking STATE_FRAC_SAMPLE_CAL/STATE_FRAC_SYNC_WAIT
+                        # forever -- this is a deliberate give-up, not a sync failure.
+                        self.logger.warning(f"Fractional sample delay calibration gave up after "
+                                             f"{self.frac_cal_timeout_s:.1f}s, accepting residual taus: {taus}")
+                        self.frac_cal_start_time = None
                         self.current_state = "STATE_IQ_CAL"
+                    else:
+                        # Determine and set tune values
+                        frac_delay_update_flag = False
+                        fs_ppm_offsets=[0]*self.M
+
+                        for m in range(self.M-1):
+                            if abs(taus[m]) > self.frac_delay_tolerance:
+                                fs_ppm_offsets[m+1] = np.sign(taus[m]) * np.abs(taus[m] * self.FRAC_FS_TUNE_GAIN) * self.MIN_FS_PPM_OFFSET
+                                frac_delay_update_flag = True
+
+                        if frac_delay_update_flag:
+                            self.logger.debug(f"Sending ppm offsets: {fs_ppm_offsets}")
+                            msg_byte_array = inter_module_messages.pack_msg_sample_freq_tune(self.module_identifier, fs_ppm_offsets)
+                            self.rtl_daq_socket.send(msg_byte_array)
+                            reply = self.rtl_daq_socket.recv()
+                            self.logger.debug(f"Received reply: {reply}")
+                            self.last_update_ind=self.iq_header.cpi_index
+                            self.current_state = "STATE_FRAC_SYNC_WAIT"
+                        else:
+                            self.frac_cal_start_time = None
+                            self.current_state = "STATE_IQ_CAL"
                 #
                 #------------------------------------------>
                 #

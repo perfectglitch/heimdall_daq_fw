@@ -269,6 +269,33 @@ class HWC():
             self.logger.debug(f"Received reply: {reply}")
 
 
+    def _map_ui_gain(self, gain_tenths_db):
+        """
+            Maps a gain value as sent by the (unmodifiable) web UI -- always
+            expressed on the RTL-SDR/R820T's 0-49.6dB discrete scale,
+            regardless of which backend is actually running -- onto an index
+            into self.valid_gains, the table that actually drives the active
+            backend.
+
+            For the rtlsdr backend this is an exact-match lookup, identical
+            to the pre-existing behaviour (self.valid_gains *is*
+            self.rtlsdr_valid_gains). For usrp, whose B210 gain range the UI
+            has no way to select (0-76dB vs. the UI's 0-49.6dB), the request
+            is rescaled proportionally by dB value instead of requiring an
+            exact match, so every UI gain step still lands somewhere sensible
+            across the USRP's real, wider range.
+
+            :raises ValueError: gain_tenths_db isn't one of the UI's valid
+                RTL-SDR gain steps (mirrors the previous exact-match
+                behaviour's error signalling).
+        """
+        ui_index = self.rtlsdr_valid_gains.index(gain_tenths_db) # validates the incoming value; raises ValueError if bogus
+        if self.valid_gains is self.rtlsdr_valid_gains:
+            return ui_index
+        ratio = gain_tenths_db / self.rtlsdr_valid_gains[-1]
+        target = round(ratio * self.usrp_valid_gains[-1] / 10) * 10 # snap to the USRP table's 1dB grid
+        return self.valid_gains.index(target)
+
     def _change_gains(self):
         """
             Sends gain tuning request to the receiver module through the 
@@ -352,10 +379,10 @@ class HWC():
             try:
                 if self.noise_source_state: # The noise source is turned on, we are storing only the gains
                     for m in range(self.M):
-                        self.last_gains[m] = self.valid_gains.index(params[m])
+                        self.last_gains[m] = self._map_ui_gain(params[m])
                 else:
                     for m in range(self.M):
-                        self.gains[m] = self.valid_gains.index(params[m])
+                        self.gains[m] = self._map_ui_gain(params[m])
                     self._change_gains()
                 # Setting gain implies disabling AGC
                 self.agc = False
