@@ -85,9 +85,21 @@ typedef struct
     int daq_buffer_size;
     long sample_rate;
     long center_freq;
+    long lo_offset;         // Hz, 0 = disabled. B2x0 is zero-IF, so LO leakage
+                             // lands as a DC spike right at center_freq; tuning
+                             // the LO this far away (RF) while UHD's DSP mixer
+                             // shifts back to center_freq (baseband) moves that
+                             // spike out of the band of interest instead.
     int gain;               // tenths of dB, e.g. 300 = 30.0 dB
     int en_noise_source_ctr;
     int log_level;
+    // [calibration]
+    int std_ch_ind;         // Must mirror delay_sync.py's [calibration] std_ch_ind --
+                             // that module measures every channel's delay against this
+                             // one, so the 's' handler's reference-device skip target
+                             // (see its comment) has to agree on which flat channel is
+                             // "the standard channel" or its corrections target the
+                             // wrong device pairing.
     // [usrp]
     char serial[MAX_USRP][64];
     int num_ch_dev[MAX_USRP];
@@ -114,6 +126,7 @@ typedef struct
     float hackrf_tx_gain_db;
     int hackrf_amp_enable;
     long hackrf_tx_freq;    // 0 = auto-track center_freq
+    double hackrf_freq_correction_ppm; // see HackRFNoiseSource::freq_correction_ppm
 } configuration;
 
 static int handler(void* conf_struct, const char* section, const char* name, const char* value)
@@ -128,9 +141,11 @@ static int handler(void* conf_struct, const char* section, const char* name, con
     else if (MATCH("daq", "daq_buffer_size")) {pconfig->daq_buffer_size = atoi(value);}
     else if (MATCH("daq", "sample_rate"))   {pconfig->sample_rate = atol(value);}
     else if (MATCH("daq", "center_freq"))   {pconfig->center_freq = atol(value);}
+    else if (MATCH("daq", "lo_offset"))     {pconfig->lo_offset = atol(value);}
     else if (MATCH("daq", "gain"))          {pconfig->gain = atoi(value);}
     else if (MATCH("daq", "en_noise_source_ctr")) {pconfig->en_noise_source_ctr = atoi(value);}
     else if (MATCH("daq", "log_level"))     {pconfig->log_level = atoi(value);}
+    else if (MATCH("calibration", "std_ch_ind")) {pconfig->std_ch_ind = atoi(value);}
     else if (MATCH("usrp", "serial_0"))     {strncpy(pconfig->serial[0], value, sizeof(pconfig->serial[0])-1);}
     else if (MATCH("usrp", "serial_1"))     {strncpy(pconfig->serial[1], value, sizeof(pconfig->serial[1])-1);}
     else if (MATCH("usrp", "serial_2"))     {strncpy(pconfig->serial[2], value, sizeof(pconfig->serial[2])-1);}
@@ -150,6 +165,7 @@ static int handler(void* conf_struct, const char* section, const char* name, con
     else if (MATCH("noise_source", "tx_gain_db")) {pconfig->hackrf_tx_gain_db = (float) atof(value);}
     else if (MATCH("noise_source", "amp_enable")) {pconfig->hackrf_amp_enable = atoi(value);}
     else if (MATCH("noise_source", "tx_freq")) {pconfig->hackrf_tx_freq = atol(value);}
+    else if (MATCH("noise_source", "freq_correction_ppm")) {pconfig->hackrf_freq_correction_ppm = atof(value);}
     else {return 0;}
     return 0;
 }
@@ -177,6 +193,17 @@ struct HackRFNoiseSource
 
     long tx_freq_override = 0; // 0 = auto-track RX center_freq
     long current_freq = 0;
+    // Non-original/clone HackRF units can have a crystal well outside the
+    // genuine board's ~20ppm spec -- libhackrf has no equivalent of
+    // rtlsdr_set_freq_correction to calibrate this out, so it has to be
+    // compensated here instead. The error is proportional to absolute
+    // frequency, which is why this can look fine at low frequencies (a few
+    // hundred kHz off at 900MHz, lost in the 8MHz TX bandwidth) and only
+    // become a real problem higher up (up to ~2MHz off at 5.8GHz, enough to
+    // partially or fully miss the USRP's much narrower RX capture window --
+    // see daq_chain_config.ini's sample_rate). 0 = no correction (previous
+    // behavior).
+    double freq_correction_ppm = 0.0;
 
     static uint32_t xorshift32(uint32_t& s)
     {
@@ -203,9 +230,10 @@ struct HackRFNoiseSource
         return 0;
     }
 
-    bool init(const char* serial, int sample_rate, float gain_db, int amp_enable, long tx_freq)
+    bool init(const char* serial, int sample_rate, float gain_db, int amp_enable, long tx_freq, double freq_correction_ppm_)
     {
         tx_freq_override = tx_freq;
+        freq_correction_ppm = freq_correction_ppm_;
         int rc = hackrf_init();
         if (rc != HACKRF_SUCCESS)
         {
@@ -234,8 +262,14 @@ struct HackRFNoiseSource
     void set_center_freq(long rx_center_freq)
     {
         if (!available) return;
-        current_freq = (tx_freq_override != 0) ? tx_freq_override : rx_center_freq;
+        long target_freq = (tx_freq_override != 0) ? tx_freq_override : rx_center_freq;
+        // Positive ppm = this unit's crystal runs fast, so it actually
+        // transmits *above* whatever we ask for -- ask for less to
+        // compensate, and vice versa for a slow crystal.
+        current_freq = target_freq - (long) std::llround(target_freq * (freq_correction_ppm / 1.0e6));
         hackrf_set_freq(dev, (uint64_t) current_freq);
+        log_info("HackRF noise source tuned to %ld Hz (requested %ld Hz, correction %.1f ppm)",
+                 current_freq, target_freq, freq_correction_ppm);
     }
 
     void set_enabled(bool enable)
@@ -404,6 +438,18 @@ static int apply_rx_gain(usrp_dev_struct& dev, int chan, int gain_tenths_db)
  *  Device open / PPS sync
  *===========================================================================
  */
+// config.lo_offset != 0 tunes the RF LO away from the target frequency while
+// UHD's DSP mixer shifts the baseband back to it, so the LO-leakage DC spike
+// (inherent to the B2x0's zero-IF frontend) lands off to the side of the
+// passband instead of on top of it. lo_offset == 0 keeps the previous
+// behavior (LO placed directly at the target frequency).
+static uhd::tune_request_t make_tune_request(double freq)
+{
+    if (config.lo_offset != 0)
+        return uhd::tune_request_t(freq, (double) config.lo_offset);
+    return uhd::tune_request_t(freq);
+}
+
 static std::string build_addr(int slot)
 {
     std::string addr;
@@ -422,45 +468,14 @@ static std::string build_addr(int slot)
     return addr;
 }
 
-static bool open_and_sync_devices()
+// PPS-synchronizes all devices' time references (device 0 is the master)
+// and issues a simultaneous STREAM_MODE_START_CONTINUOUS across all of them.
+// Shared by open_and_sync_devices() (first start) and
+// restart_usrp_devices() (recovery after a live retune or a calibration
+// restart) so both paths establish the exact same known-good multi-device
+// alignment.
+static void pps_sync_and_start_streams()
 {
-    // Devices must be opened one at a time -- USB discovery isn't thread-safe.
-    for (int d = 0; d < n_active_devs; d++)
-    {
-        usrp_dev_struct& dev = usrp_devs[d];
-        std::string addr = build_addr(dev.slot);
-        log_info("Opening USRP %d (serial %s), args: %s", d, dev.serial.c_str(), addr.c_str());
-        try
-        {
-            dev.usrp = uhd::usrp::multi_usrp::make(uhd::device_addr_t(addr));
-        }
-        catch (const uhd::exception& e)
-        {
-            log_fatal("Failed to open USRP %d: %s", d, e.what());
-            return false;
-        }
-
-        std::string subdev_str = (dev.num_ch == 2) ? std::string(config.subdev) : std::string("A:A");
-        dev.usrp->set_rx_subdev_spec(uhd::usrp::subdev_spec_t(subdev_str));
-        dev.usrp->set_rx_rate((double) config.sample_rate);
-        for (int c = 0; c < dev.num_ch; c++)
-        {
-            dev.usrp->set_rx_freq(uhd::tune_request_t((double) config.center_freq), c);
-            channel_gain[dev.ch_offset + c] = apply_rx_gain(dev, c, config.gain);
-            dev.usrp->set_rx_antenna(config.antenna, c);
-        }
-    }
-
-    // --- Create RX streamers before PPS sync ---
-    for (int d = 0; d < n_active_devs; d++)
-    {
-        usrp_dev_struct& dev = usrp_devs[d];
-        uhd::stream_args_t args("sc16", "sc16");
-        args.channels.clear();
-        for (int c = 0; c < dev.num_ch; c++) args.channels.push_back((size_t) c);
-        dev.rx_stream = dev.usrp->get_rx_stream(args);
-    }
-
     uhd::stream_cmd_t stream_cmd(uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS);
     if (n_active_devs == 1)
     {
@@ -502,8 +517,154 @@ static bool open_and_sync_devices()
         }
         usrp_devs[d].rx_stream->issue_stream_cmd(dev_cmd);
     }
+}
 
+// Opens (or reopens) a single USRP session and applies the fixed
+// per-session configuration -- subdev, sample rate, antenna, DC offset
+// correction, and the per-channel gain already recorded in channel_gain[]
+// (so a reopen restores whatever gain was live, not necessarily config.gain).
+// Does not touch streaming or the streamer object. Shared by
+// open_and_sync_devices() (first start, gain not live yet -> pass
+// config.gain there first) and restart_usrp_devices() (reopen with the
+// gain each channel already had).
+static bool open_and_configure_device(int d, long freq)
+{
+    usrp_dev_struct& dev = usrp_devs[d];
+    std::string addr = build_addr(dev.slot);
+    log_info("Opening USRP %d (serial %s), args: %s", d, dev.serial.c_str(), addr.c_str());
+    try
+    {
+        dev.usrp = uhd::usrp::multi_usrp::make(uhd::device_addr_t(addr));
+    }
+    catch (const uhd::exception& e)
+    {
+        log_fatal("Failed to open USRP %d: %s", d, e.what());
+        return false;
+    }
+
+    std::string subdev_str = (dev.num_ch == 2) ? std::string(config.subdev) : std::string("A:A");
+    dev.usrp->set_rx_subdev_spec(uhd::usrp::subdev_spec_t(subdev_str));
+    dev.usrp->set_rx_rate((double) config.sample_rate);
+    for (int c = 0; c < dev.num_ch; c++)
+    {
+        dev.usrp->set_rx_freq(make_tune_request((double) freq), c);
+        try { dev.usrp->set_rx_dc_offset(true, c); } catch (const uhd::exception& e) {
+            log_warn("USRP %d ch %d: set_rx_dc_offset not supported: %s", d, c, e.what());
+        }
+        channel_gain[dev.ch_offset + c] = apply_rx_gain(dev, c, channel_gain[dev.ch_offset + c]);
+        dev.usrp->set_rx_antenna(config.antenna, c);
+    }
     return true;
+}
+
+static bool open_and_sync_devices()
+{
+    // channel_gain[] hasn't been touched yet on the very first call --
+    // seed it with the configured startup gain so open_and_configure_device()
+    // (which re-applies whatever is already in channel_gain[]) has something
+    // sane to apply.
+    for (int c = 0; c < ch_no; c++) channel_gain[c] = config.gain;
+
+    // Devices must be opened one at a time -- USB discovery isn't thread-safe.
+    for (int d = 0; d < n_active_devs; d++)
+        if (!open_and_configure_device(d, config.center_freq))
+            return false;
+
+    // --- Create RX streamers before PPS sync ---
+    for (int d = 0; d < n_active_devs; d++)
+    {
+        usrp_dev_struct& dev = usrp_devs[d];
+        uhd::stream_args_t args("sc16", "sc16");
+        args.channels.clear();
+        for (int c = 0; c < dev.num_ch; c++) args.channels.push_back((size_t) c);
+        dev.rx_stream = dev.usrp->get_rx_stream(args);
+    }
+
+    pps_sync_and_start_streams();
+    return true;
+}
+
+// Defined further down (per-device reader thread); forward-declared here so
+// restart_usrp_devices() can respawn reader threads after reopening.
+static void reader_thread_entry(int dev_idx);
+
+// Full stop/close/reopen/restart of every USRP device, at a (possibly
+// unchanged) frequency -- used both for a live frequency change and for a
+// calibration restart with no frequency change (see the ZMQ 'c' handler and
+// its comment). A live retune while streaming reliably overflows every
+// device's small FPGA-side buffer a few seconds later (each device's
+// control link blocks on LO lock for several sequential set_rx_freq()
+// calls, starving the others' USB transfers the whole time) -- confirmed
+// directly, and it silently drops an unknown number of samples per device,
+// permanently desyncing buff_ind across devices by far more than
+// STATE_SAMPLE_CAL's 's' correction is willing to touch (see
+// MAX_PLAUSIBLE_PPM in the ZMQ control thread). A milder stop/retune/PPS-
+// resync/restart on the *same* already-open UHD sessions was tried first
+// but the reused rx_streamer never resumed producing samples after
+// STREAM_MODE_STOP_CONTINUOUS on this hardware/UHD version (recv() spun on
+// timeouts indefinitely) -- confirmed live. Closing and reopening each
+// session from scratch, exactly like a fresh process start, is the only
+// path confirmed to work, so that's what this does, just without paying the
+// cost of killing and relaunching the whole process (device enumeration is
+// still the slow part -- expect a multi-second gap in the data, same as
+// open_and_sync_devices() takes at startup).
+//
+// Reader threads dereference dev.rx_stream (and indirectly dev.usrp) on
+// every recv() call with no synchronization of their own, so they must be
+// fully stopped and joined before any device is touched here, and only
+// restarted once every device is back up -- swapping either out from under
+// a live reader thread would be a data race.
+static bool restart_usrp_devices(long new_center_freq_hz)
+{
+    running.store(false);
+    for (int d = 0; d < n_active_devs; d++)
+        if (usrp_devs[d].reader_thread.joinable())
+            usrp_devs[d].reader_thread.join();
+
+    for (int d = 0; d < n_active_devs; d++)
+    {
+        usrp_devs[d].rx_stream.reset();
+        usrp_devs[d].usrp.reset();
+    }
+
+    bool ok = true;
+    for (int d = 0; d < n_active_devs && ok; d++)
+        ok = open_and_configure_device(d, new_center_freq_hz);
+
+    if (ok)
+    {
+        for (int d = 0; d < n_active_devs; d++)
+        {
+            usrp_dev_struct& dev = usrp_devs[d];
+            uhd::stream_args_t args("sc16", "sc16");
+            args.channels.clear();
+            for (int c = 0; c < dev.num_ch; c++) args.channels.push_back((size_t) c);
+            dev.rx_stream = dev.usrp->get_rx_stream(args);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(buff_ind_mutex);
+            for (int d = 0; d < n_active_devs; d++)
+                usrp_devs[d].buff_ind = 0;
+        }
+
+        pps_sync_and_start_streams();
+        running.store(true);
+        for (int d = 0; d < n_active_devs; d++)
+            usrp_devs[d].reader_thread = std::thread(reader_thread_entry, d);
+    }
+    else
+    {
+        // Some device didn't come back -- reader threads would just
+        // dereference a null usrp/rx_stream if restarted against it, so
+        // don't; shut the process down cleanly instead of leaving it
+        // running with no acquisition and no way to recover.
+        log_fatal("Failed to reopen USRPs after retune -- acquisition is down, exiting");
+        exit_flag.store(true);
+        buff_ind_cond.notify_all();
+    }
+
+    return ok;
 }
 
 /*
@@ -610,18 +771,28 @@ static void* zmq_control_thread(void*)
         if (msg.command_identifier == 'r')
         {
             log_info("Signal 'r': Reconfiguring the tuner (center_freq/gain applied live; sample_rate change requires a restart and is ignored)");
-            uint32_t* parameters = (uint32_t*) msg.parameters;
-            new_center_freq = parameters[0];
+            // center_freq is 8 byte (offset 0), sample_rate and gain are
+            // 4 byte each (offsets 8, 12) -- see pack_msg_reconfiguration().
+            // memcpy instead of a reinterpret_cast: msg.parameters isn't
+            // 8-byte aligned within hdaq_im_msg_struct (2 single-byte fields
+            // precede it), so a uint64_t* cast would be an unaligned access.
+            uint64_t freq_u64; std::memcpy(&freq_u64, msg.parameters, sizeof(freq_u64));
+            uint32_t gain_u32; std::memcpy(&gain_u32, msg.parameters + 12, sizeof(gain_u32));
+            new_center_freq = (long) freq_u64;
             center_freq_change_flag = 1;
-            for (int i = 0; i < ch_no; i++) new_gains[i] = (int) parameters[2];
+            for (int i = 0; i < ch_no; i++) new_gains[i] = (int) gain_u32;
             gain_change_flag = 1;
         }
         else if (msg.command_identifier == 'c')
         {
-            uint32_t* parameters = (uint32_t*) msg.parameters;
-            new_center_freq = parameters[0];
+            // center_freq is 8 byte, not 4 -- 'I' tops out at ~4.295GHz,
+            // below common bands like 5.8GHz (confirmed live). See
+            // pack_msg_rf_tune() and the 'r' handler's comment on why this
+            // is a memcpy rather than a pointer cast.
+            uint64_t freq_u64; std::memcpy(&freq_u64, msg.parameters, sizeof(freq_u64));
+            new_center_freq = (long) freq_u64;
             center_freq_change_flag = 1;
-            log_info("Signal 'c': New center frequency: %u MHz", (unsigned int)(parameters[0] / 1000000));
+            log_info("Signal 'c': New center frequency: %lu MHz", (unsigned long)(freq_u64 / 1000000));
         }
         else if (msg.command_identifier == 'g')
         {
@@ -699,8 +870,8 @@ static void* zmq_control_thread(void*)
             // and wait for the next clean recalibration pass instead.
             const float MAX_PLAUSIBLE_PPM = 0.002f;
             const int STEP = 1; // samples per correction cycle -- small and monotonic, no overshoot risk
-            int ref_dev_slot = usrp_devs[0].slot;
-            int ref_channel_dev = channel_to_dev[0];
+            int ref_dev_slot = usrp_devs[channel_to_dev[config.std_ch_ind]].slot;
+            int ref_channel_dev = channel_to_dev[config.std_ch_ind];
             float* offsets = (float*) msg.parameters;
             for (int m = 0; m < ch_no; m++)
             {
@@ -814,7 +985,7 @@ int main(int argc, char** argv)
     {
         noise_source.init(config.hackrf_serial, config.hackrf_tx_sample_rate,
                            config.hackrf_tx_gain_db, config.hackrf_amp_enable,
-                           config.hackrf_tx_freq);
+                           config.hackrf_tx_freq, config.hackrf_freq_correction_ppm);
         noise_source.set_center_freq(current_center_freq);
     }
 
@@ -1012,9 +1183,55 @@ int main(int argc, char** argv)
 
         if (do_freq_change)
         {
-            for (int d = 0; d < n_active_devs; d++)
-                for (int c = 0; c < usrp_devs[d].num_ch; c++)
-                    usrp_devs[d].usrp->set_rx_freq(uhd::tune_request_t((double) local_new_center_freq), c);
+            if (local_new_center_freq == current_center_freq)
+            {
+                // No actual retune -- this is an explicit resync-only
+                // request (calibration expired without a frequency change,
+                // see hw_controller.py). There's no tuning step to make
+                // hitless here; what's actually broken is buff_ind
+                // consistency across devices from some earlier discontinuity,
+                // and a full close/reopen is the only confirmed way to
+                // re-establish that (see restart_usrp_devices()'s comment).
+                bool ok = restart_usrp_devices(local_new_center_freq);
+                read_buff_ind = 0; // buff_ind was reset to 0 for every device above
+                if (!ok)
+                {
+                    // restart_usrp_devices() already set exit_flag; re-lock
+                    // before breaking so the unconditional lock.unlock()
+                    // just after the loop (normal exit path) doesn't throw
+                    // on a mutex it doesn't own.
+                    lock.lock();
+                    break;
+                }
+            }
+            else
+            {
+                // Genuine retune. A plain sequential set_rx_freq() per
+                // channel (5 blocking calls, each waiting for its own LO
+                // lock) held up each device's control link long enough to
+                // starve the *other* devices' still-running USB transfers,
+                // overflowing their small FPGA-side buffers a few seconds
+                // later (confirmed live) -- which is what actually broke
+                // calibration, not the new frequency itself. Tagging every
+                // channel's set_rx_freq() with the same near-future
+                // set_command_time() instead schedules all of them as
+                // queued register writes the devices apply on their own at
+                // that instant, so this loop no longer blocks on lock-detect
+                // for each of 5 channels back to back -- the streams never
+                // have to stop, and the other devices' USB transfers should
+                // no longer be starved. Unverified against real hardware:
+                // if this still overflows, fall back to the guaranteed-safe
+                // (but ~10s-of-silence) full reopen path above by sending
+                // the same frequency again as a follow-up resync request.
+                uhd::time_spec_t cmd_time = usrp_devs[0].usrp->get_time_now() + uhd::time_spec_t(0.1);
+                for (int d = 0; d < n_active_devs; d++)
+                    usrp_devs[d].usrp->set_command_time(cmd_time);
+                for (int d = 0; d < n_active_devs; d++)
+                    for (int c = 0; c < usrp_devs[d].num_ch; c++)
+                        usrp_devs[d].usrp->set_rx_freq(make_tune_request((double) local_new_center_freq), c);
+                for (int d = 0; d < n_active_devs; d++)
+                    usrp_devs[d].usrp->clear_command_time();
+            }
             current_center_freq = local_new_center_freq;
             noise_source.set_center_freq(current_center_freq);
             log_info("Center frequency changed to %ld Hz", current_center_freq);
@@ -1047,8 +1264,13 @@ int main(int argc, char** argv)
     for (int d = 0; d < n_active_devs; d++)
     {
         if (usrp_devs[d].reader_thread.joinable()) usrp_devs[d].reader_thread.join();
-        uhd::stream_cmd_t stop_cmd(uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS);
-        try { usrp_devs[d].rx_stream->issue_stream_cmd(stop_cmd); } catch (...) {}
+        // rx_stream can be null here if restart_usrp_devices() failed
+        // partway through reopening a device (see its failure path).
+        if (usrp_devs[d].rx_stream)
+        {
+            uhd::stream_cmd_t stop_cmd(uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS);
+            try { usrp_devs[d].rx_stream->issue_stream_cmd(stop_cmd); } catch (...) {}
+        }
     }
     noise_source.close();
     if (ctrl_thread.joinable()) ctrl_thread.join();

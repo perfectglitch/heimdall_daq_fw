@@ -569,11 +569,45 @@ class delaySynchronizer():
                     delay_update_flag = 0
                     fs_ppm_offsets=[0]*self.M 
 
-                    # ->  Calculate correlation functions            
+                    # ->  Calculate correlation functions
                     np_zeros = np.zeros(self.N_proc, dtype=np.complex64)
                     x_padd = np.concatenate([iq_samples[self.std_ch_ind, 0:self.N_proc], np_zeros])
                     x_fft = fft.fft(x_padd, workers=4, overwrite_x=True)
-                    
+
+                    # Diagnostic only, doesn't affect calibration: the noise
+                    # source is supposed to look like flat broadband power
+                    # across this whole capture window. A non-original/clone
+                    # HackRF's crystal error is proportional to absolute
+                    # frequency, so it can be invisible at low frequencies
+                    # and only push the transmitted noise partly or fully
+                    # outside this (much narrower) RX window at high ones --
+                    # which shows up here as power concentrated toward one
+                    # edge instead of flat, i.e. a non-zero power-weighted
+                    # spectral centroid. Logged every attempt (not just on a
+                    # dynamic-range failure below) so a consistently
+                    # near-edge or clipped-looking centroid is visible even
+                    # before calibration outright fails. See
+                    # [noise_source] freq_correction_ppm.
+                    if self.iq_header.frame_type == IQHeader.FRAME_TYPE_CAL:
+                        # A fresh, unpadded FFT of just the reference channel's
+                        # own samples -- deliberately not reusing x_fft above,
+                        # which is zero-padded to 2*N_proc for the correlation
+                        # and would need its bins/fftfreq sized to match that
+                        # padding instead of N_proc.
+                        x_psd_fft = fft.fft(iq_samples[self.std_ch_ind, 0:self.N_proc], workers=4)
+                        psd = np.abs(x_psd_fft)**2
+                        freq_bins = np.fft.fftfreq(self.N_proc, d=1.0/self.iq_header.sampling_freq)
+                        psd_total = np.sum(psd)
+                        if psd_total > 0:
+                            centroid_hz = np.sum(freq_bins * psd) / psd_total
+                            half_bw = self.iq_header.sampling_freq / 2
+                            self.logger.info(
+                                "Calibration signal spectral centroid: {:+.0f} Hz from RX center "
+                                "(RX center {:.0f} Hz, capture half-bandwidth {:.0f} Hz -- a centroid "
+                                "near +/-{:.0f} Hz suggests the noise source is clipped at that edge "
+                                "of the capture window, not just off-center within it)".format(
+                                    centroid_hz, self.iq_header.rf_center_freq, half_bw, half_bw))
+
                     for m in self.channel_list:
                         y_padd = np.concatenate([np_zeros, iq_samples[m, 0:self.N_proc]])
                         y_fft = fft.fft(y_padd, workers=4, overwrite_x=True)
