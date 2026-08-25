@@ -85,11 +85,19 @@ typedef struct
     int daq_buffer_size;
     long sample_rate;
     long center_freq;
-    long lo_offset;         // Hz, 0 = disabled. B2x0 is zero-IF, so LO leakage
-                             // lands as a DC spike right at center_freq; tuning
-                             // the LO this far away (RF) while UHD's DSP mixer
-                             // shifts back to center_freq (baseband) moves that
-                             // spike out of the band of interest instead.
+    // Fraction of sample_rate to tune the LO away from center_freq by, 0 =
+    // disabled. B2x0 is zero-IF, so LO leakage lands as a spike at
+    // center_freq; UHD's DSP mixer shifts baseband back to center_freq, so
+    // the leakage ends up at baseband offset lo_offset_frac*sample_rate --
+    // relocated, not removed. What actually removes it is UHD's own
+    // FPGA-side decimation filter's stopband, which only attenuates near/
+    // past +/-sample_rate/2 -- confirmed live: too small an absolute Hz
+    // offset just moved the spike to another bin still inside the passband.
+    // A *fraction* of sample_rate (not a fixed Hz value) is deliberate: the
+    // passband this needs to clear scales with sample_rate, so a fixed Hz
+    // offset that clears it at one sample_rate can land back in the middle
+    // of the passband at a higher one. Keep this comfortably under 0.5.
+    double lo_offset_frac;
     int gain;               // tenths of dB, e.g. 300 = 30.0 dB
     int en_noise_source_ctr;
     int log_level;
@@ -141,7 +149,7 @@ static int handler(void* conf_struct, const char* section, const char* name, con
     else if (MATCH("daq", "daq_buffer_size")) {pconfig->daq_buffer_size = atoi(value);}
     else if (MATCH("daq", "sample_rate"))   {pconfig->sample_rate = atol(value);}
     else if (MATCH("daq", "center_freq"))   {pconfig->center_freq = atol(value);}
-    else if (MATCH("daq", "lo_offset"))     {pconfig->lo_offset = atol(value);}
+    else if (MATCH("daq", "lo_offset_frac")) {pconfig->lo_offset_frac = atof(value);}
     else if (MATCH("daq", "gain"))          {pconfig->gain = atoi(value);}
     else if (MATCH("daq", "en_noise_source_ctr")) {pconfig->en_noise_source_ctr = atoi(value);}
     else if (MATCH("daq", "log_level"))     {pconfig->log_level = atoi(value);}
@@ -387,6 +395,19 @@ static int channel_to_dev[64];
 // are never touched from two different locks.
 static int center_freq_change_flag = 0;
 static long new_center_freq = 0;
+// Set only by the dedicated 'y' command (hw_controller.py's calibration-
+// expiration resync trigger) -- deliberately NOT inferred from a 'c'/'r'
+// request whose frequency happens to equal current_center_freq. That was
+// tried first and confirmed live to misfire: the krakensdr_doa web UI
+// sends its configured frequency as an ordinary 'c' on every connect
+// (including the very first one after a fresh boot), which routinely
+// matches current_center_freq every time -- triggering a full, disruptive
+// device close/reopen (restart_usrp_devices()) moments after a perfectly
+// good boot already did the exact same thing, for no reason. Worse, back
+// to back reopens like that were observed to leave two devices wedged
+// (ERROR_CODE_LATE_COMMAND, then a hang needing a manual SIGKILL). A
+// same-frequency 'c'/'r' is now a no-op; only this flag forces a resync.
+static int resync_requested_flag = 0;
 static int gain_change_flag = 0;
 static std::vector<int> new_gains;
 static int noise_source_state = 0;
@@ -438,15 +459,24 @@ static int apply_rx_gain(usrp_dev_struct& dev, int chan, int gain_tenths_db)
  *  Device open / PPS sync
  *===========================================================================
  */
-// config.lo_offset != 0 tunes the RF LO away from the target frequency while
-// UHD's DSP mixer shifts the baseband back to it, so the LO-leakage DC spike
-// (inherent to the B2x0's zero-IF frontend) lands off to the side of the
-// passband instead of on top of it. lo_offset == 0 keeps the previous
-// behavior (LO placed directly at the target frequency).
+// config.lo_offset_frac != 0 tunes the RF LO away from the target frequency
+// (by lo_offset_frac*sample_rate) while UHD's DSP mixer shifts the baseband
+// back to it, so the LO-leakage spike (inherent to the B2x0's zero-IF
+// frontend) ends up at that same offset in the delivered baseband -- close
+// enough to +/-sample_rate/2 to fall in UHD's own decimation filter's
+// stopband, not just relocated to another in-band bin (see the config
+// struct's comment on lo_offset_frac for why this scales with sample_rate
+// instead of being a fixed Hz value). lo_offset_frac == 0 keeps the
+// previous behavior (LO placed directly at the target frequency).
 static uhd::tune_request_t make_tune_request(double freq)
 {
-    if (config.lo_offset != 0)
-        return uhd::tune_request_t(freq, (double) config.lo_offset);
+    if (config.lo_offset_frac != 0)
+    {
+        double lo_off_hz = config.lo_offset_frac * (double) config.sample_rate;
+        log_info("Tuning %.0f Hz with lo_offset_frac=%.3f * sample_rate=%ld -> lo_offset=%.0f Hz",
+                 freq, config.lo_offset_frac, config.sample_rate, lo_off_hz);
+        return uhd::tune_request_t(freq, lo_off_hz);
+    }
     return uhd::tune_request_t(freq);
 }
 
@@ -794,6 +824,18 @@ static void* zmq_control_thread(void*)
             center_freq_change_flag = 1;
             log_info("Signal 'c': New center frequency: %lu MHz", (unsigned long)(freq_u64 / 1000000));
         }
+        else if (msg.command_identifier == 'y')
+        {
+            // Explicit resync request (hw_controller.py: calibration
+            // expired -- STATE_TRACK lost -- without an accompanying
+            // frequency change). No parameters; always forces the full
+            // close/reopen path at the current frequency. See
+            // resync_requested_flag's comment for why this needs to be a
+            // distinct command rather than inferred from a same-frequency
+            // 'c'.
+            log_info("Signal 'y': Explicit resync request");
+            resync_requested_flag = 1;
+        }
         else if (msg.command_identifier == 'g')
         {
             log_info("Signal 'g': Gain tuning request");
@@ -873,6 +915,17 @@ static void* zmq_control_thread(void*)
             int ref_dev_slot = usrp_devs[channel_to_dev[config.std_ch_ind]].slot;
             int ref_channel_dev = channel_to_dev[config.std_ch_ind];
             float* offsets = (float*) msg.parameters;
+            // Multi-channel devices (e.g. a B210's 2 RX channels) are
+            // sample-locked to each other, so their channels' measurements
+            // against the reference agree and request the same correction
+            // in the same message. Collecting into a per-device flag first
+            // -- instead of fetch_add-ing once per channel below -- keeps
+            // each device's correction at exactly STEP per message; without
+            // this, a 2-channel device double-applies STEP every cycle,
+            // permanently overshooting its target by 1 sample and never
+            // converging (confirmed live: channels sharing a device
+            // oscillate delay +1/-1 forever instead of settling at 0).
+            bool dev_needs_skip[MAX_USRP] = {false};
             for (int m = 0; m < ch_no; m++)
             {
                 float mag = std::fabs(offsets[m]);
@@ -886,10 +939,13 @@ static void* zmq_control_thread(void*)
                 int d = channel_to_dev[m];
                 if (d == ref_channel_dev) continue; // same device as the reference channel -- not fixable by a device-level skip
                 if (offsets[m] > 0)
-                    align_skip_samples[usrp_devs[d].slot].fetch_add(STEP);
+                    dev_needs_skip[usrp_devs[d].slot] = true;
                 else
-                    align_skip_samples[ref_dev_slot].fetch_add(STEP);
+                    dev_needs_skip[ref_dev_slot] = true;
             }
+            for (int slot = 0; slot < MAX_USRP; slot++)
+                if (dev_needs_skip[slot])
+                    align_skip_samples[slot].fetch_add(STEP);
             log_info("Signal 's': applied incremental per-device alignment nudges");
         }
         else if (msg.command_identifier == 'n')
@@ -1171,67 +1227,68 @@ int main(int argc, char** argv)
          */
         bool do_freq_change = center_freq_change_flag;
         long local_new_center_freq = new_center_freq;
+        bool do_resync = resync_requested_flag;
         bool do_gain_change = gain_change_flag;
         std::vector<int> local_new_gains = new_gains;
         bool do_noise_toggle = (last_noise_source_state != noise_source_state) && config.en_noise_source_ctr;
         int local_noise_source_state = noise_source_state;
         center_freq_change_flag = 0;
+        resync_requested_flag = 0;
         gain_change_flag = 0;
         last_noise_source_state = noise_source_state;
 
         lock.unlock();
 
-        if (do_freq_change)
+        // A 'c'/'r' request whose frequency matches current_center_freq is
+        // deliberately a no-op (see resync_requested_flag's comment) --
+        // only do_resync forces the full reopen path, and only a genuine
+        // frequency difference triggers the timed-retune path.
+        if (do_resync)
         {
-            if (local_new_center_freq == current_center_freq)
+            // Explicit resync request (hw_controller.py: calibration
+            // expired without a frequency change). There's no tuning step
+            // to make hitless here; what's actually broken is buff_ind
+            // consistency across devices from some earlier discontinuity,
+            // and a full close/reopen is the only confirmed way to
+            // re-establish that (see restart_usrp_devices()'s comment).
+            bool ok = restart_usrp_devices(current_center_freq);
+            read_buff_ind = 0; // buff_ind was reset to 0 for every device above
+            if (!ok)
             {
-                // No actual retune -- this is an explicit resync-only
-                // request (calibration expired without a frequency change,
-                // see hw_controller.py). There's no tuning step to make
-                // hitless here; what's actually broken is buff_ind
-                // consistency across devices from some earlier discontinuity,
-                // and a full close/reopen is the only confirmed way to
-                // re-establish that (see restart_usrp_devices()'s comment).
-                bool ok = restart_usrp_devices(local_new_center_freq);
-                read_buff_ind = 0; // buff_ind was reset to 0 for every device above
-                if (!ok)
-                {
-                    // restart_usrp_devices() already set exit_flag; re-lock
-                    // before breaking so the unconditional lock.unlock()
-                    // just after the loop (normal exit path) doesn't throw
-                    // on a mutex it doesn't own.
-                    lock.lock();
-                    break;
-                }
+                // restart_usrp_devices() already set exit_flag; re-lock
+                // before breaking so the unconditional lock.unlock() just
+                // after the loop (normal exit path) doesn't throw on a
+                // mutex it doesn't own.
+                lock.lock();
+                break;
             }
-            else
-            {
-                // Genuine retune. A plain sequential set_rx_freq() per
-                // channel (5 blocking calls, each waiting for its own LO
-                // lock) held up each device's control link long enough to
-                // starve the *other* devices' still-running USB transfers,
-                // overflowing their small FPGA-side buffers a few seconds
-                // later (confirmed live) -- which is what actually broke
-                // calibration, not the new frequency itself. Tagging every
-                // channel's set_rx_freq() with the same near-future
-                // set_command_time() instead schedules all of them as
-                // queued register writes the devices apply on their own at
-                // that instant, so this loop no longer blocks on lock-detect
-                // for each of 5 channels back to back -- the streams never
-                // have to stop, and the other devices' USB transfers should
-                // no longer be starved. Unverified against real hardware:
-                // if this still overflows, fall back to the guaranteed-safe
-                // (but ~10s-of-silence) full reopen path above by sending
-                // the same frequency again as a follow-up resync request.
-                uhd::time_spec_t cmd_time = usrp_devs[0].usrp->get_time_now() + uhd::time_spec_t(0.1);
-                for (int d = 0; d < n_active_devs; d++)
-                    usrp_devs[d].usrp->set_command_time(cmd_time);
-                for (int d = 0; d < n_active_devs; d++)
-                    for (int c = 0; c < usrp_devs[d].num_ch; c++)
-                        usrp_devs[d].usrp->set_rx_freq(make_tune_request((double) local_new_center_freq), c);
-                for (int d = 0; d < n_active_devs; d++)
-                    usrp_devs[d].usrp->clear_command_time();
-            }
+            log_info("Resynced at %ld Hz", current_center_freq);
+        }
+        else if (do_freq_change && local_new_center_freq != current_center_freq)
+        {
+            // Genuine retune. A plain sequential set_rx_freq() per channel
+            // (5 blocking calls, each waiting for its own LO lock) held up
+            // each device's control link long enough to starve the *other*
+            // devices' still-running USB transfers, overflowing their
+            // small FPGA-side buffers a few seconds later (confirmed live)
+            // -- which is what actually broke calibration, not the new
+            // frequency itself. Tagging every channel's set_rx_freq() with
+            // the same near-future set_command_time() instead schedules
+            // all of them as queued register writes the devices apply on
+            // their own at that instant, so this loop no longer blocks on
+            // lock-detect for each of 5 channels back to back -- the
+            // streams never have to stop, and the other devices' USB
+            // transfers should no longer be starved. Unverified against
+            // real hardware: if this still overflows, hw_controller.py's
+            // 'y' resync request is the fallback recovery path.
+            uhd::time_spec_t cmd_time = usrp_devs[0].usrp->get_time_now() + uhd::time_spec_t(0.1);
+            for (int d = 0; d < n_active_devs; d++)
+                usrp_devs[d].usrp->set_command_time(cmd_time);
+            for (int d = 0; d < n_active_devs; d++)
+                for (int c = 0; c < usrp_devs[d].num_ch; c++)
+                    usrp_devs[d].usrp->set_rx_freq(make_tune_request((double) local_new_center_freq), c);
+            for (int d = 0; d < n_active_devs; d++)
+                usrp_devs[d].usrp->clear_command_time();
             current_center_freq = local_new_center_freq;
             noise_source.set_center_freq(current_center_freq);
             log_info("Center frequency changed to %ld Hz", current_center_freq);

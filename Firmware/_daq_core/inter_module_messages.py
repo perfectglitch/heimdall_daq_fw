@@ -1,5 +1,40 @@
 from struct import pack
 
+def pack_msg_resync(module_identifier):
+    """
+        Prepares the byte array of an inter-module ZMQ message requesting a
+        USRP resync (device close/reopen + PPS re-sync) at the current
+        frequency, with no retune. USRP-only ('y' handler in usrp_daq.cc).
+
+        Deliberately a distinct command from pack_msg_rf_tune(), not just
+        pack_msg_rf_tune() called with the unchanged frequency: usrp_daq.cc
+        used to infer "resync" from a same-frequency 'c', but the
+        krakensdr_doa web UI also sends its configured frequency as an
+        ordinary 'c' on every connect (including right after a fresh boot),
+        which routinely matches the current frequency too -- that made the
+        inference misfire into an unnecessary, and once observed to hang,
+        device reopen moments after a perfectly good boot. A same-frequency
+        'c' is now a no-op on the receiving end; only this command forces
+        the resync.
+
+        Parameters:
+        -----------
+            :param: module_identifier: Source module id
+
+            :type: module_identifier: int
+
+        Return:
+        -------
+            Assembled message structure in byte array
+    """
+    msg_length = 128  # Total message length 128 byte
+    msg_byte_array  = pack("b", module_identifier)  # 1 byte
+    msg_byte_array += 'y'.encode('ascii')  # 1 byte
+    for m in range(msg_length - 1 - 1):
+        msg_byte_array += pack('b', 0)
+
+    return msg_byte_array
+
 def pack_msg_reconfiguration(module_identifier,center_frequency, sample_rate, gain):
     """
         Prepares the byte array of an inter-module ZMQ message for tunner reconfiguration.

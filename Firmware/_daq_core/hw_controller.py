@@ -515,19 +515,24 @@ class HWC():
 
                 # -> Detect calibration expiration (track lock lost without an
                 #    explicit frequency change) and ask usrp_daq.cc to resync --
-                #    a live retune there overflows every USRP's buffer and
-                #    permanently desyncs channels; a full stop/close/reopen is
-                #    the only thing that recovers it (see usrp_daq.cc's ZMQ 'c'
-                #    handler). An explicit frequency change already triggers
-                #    that same recovery on its own, so only fire here when the
-                #    drop out of track happened WITHOUT one (center frequency
-                #    unchanged since the last frame) to avoid doing it twice
-                #    back-to-back.
+                #    a live retune there can overflow a USRP's buffer and
+                #    permanently desync channels; a full stop/close/reopen
+                #    recovers it (see usrp_daq.cc's ZMQ 'y' handler). Uses the
+                #    dedicated 'y' command, not a same-frequency 'c' -- that
+                #    was tried first and confirmed live to misfire (this web
+                #    UI sends its configured frequency as an ordinary 'c' on
+                #    every connect, which routinely matches current frequency
+                #    too, triggering an unwanted reopen right after a fresh
+                #    boot). An explicit frequency change already triggers its
+                #    own recovery (the 'c' handler's timed-retune path), so
+                #    only fire here when the drop out of track happened
+                #    WITHOUT one (center frequency unchanged since the last
+                #    frame) to avoid doing both back-to-back.
                 if self.backend == 'usrp' \
                    and self.last_sync_state == 6 and self.iq_header.sync_state != 6 \
                    and self.iq_header.rf_center_freq == self.last_rf_center_freq:
                     self.logger.warning("Track lock lost -- requesting USRP resync at {:d} Hz".format(self.iq_header.rf_center_freq))
-                    msg_byte_array = inter_module_messages.pack_msg_rf_tune(self.module_identifier, self.iq_header.rf_center_freq)
+                    msg_byte_array = inter_module_messages.pack_msg_resync(self.module_identifier)
                     self.rtl_daq_socket.send(msg_byte_array)
                     reply = self.rtl_daq_socket.recv()
                     self.logger.debug(f"Received reply: {reply}")
