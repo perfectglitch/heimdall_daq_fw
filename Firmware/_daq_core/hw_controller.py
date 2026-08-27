@@ -23,6 +23,7 @@
 from struct import pack, unpack
 import threading
 import logging
+from time import monotonic
 
 # Import third-party modules
 import numpy as np
@@ -105,6 +106,23 @@ class HWC():
         self.last_sync_state = 0
         self.last_rf_center_freq = 0
 
+        # Watchdog for calibration that never converges (sync_state stuck
+        # below 5/TRACK_LOCK indefinitely -- e.g. a marginal correlation dynamic
+        # range that occasionally clears the threshold but never for every
+        # channel at once). stuck_cal_start_time is the monotonic() time the
+        # current below-lock streak began (None while locked); once it's been
+        # stuck longer than stuck_cal_timeout_s, a resync is requested the same
+        # way a lost track lock is. last_resync_time enforces resync_cooldown_s
+        # between any two auto-triggered resyncs (this one or the lost-track
+        # one below) so a persistent hardware fault can't retrigger the
+        # stop/reopen recovery back-to-back -- that recovery itself is not free
+        # (a live retune briefly drives every channel into overdrive) and has
+        # been observed to bring the whole box down when repeated too soon.
+        self.stuck_cal_start_time = None
+        self.last_resync_time = None
+        self.stuck_cal_timeout_s = 120
+        self.resync_cooldown_s = 300
+
         # Overwrite default configuration
         self._read_config_file("daq_chain_config.ini")
         self.iq_header = IQHeader()
@@ -162,6 +180,8 @@ class HWC():
         self.cal_track_mode = parser.getint('calibration','cal_track_mode')        
         self.rf_center_frequency = parser.getint('daq','center_freq')
         self.max_sync_fails = parser.getint('calibration','maximum_sync_fails')
+        self.stuck_cal_timeout_s = parser.getfloat('calibration', 'stuck_cal_timeout_s', fallback=60.0)
+        self.resync_cooldown_s = parser.getfloat('calibration', 'resync_cooldown_s', fallback=300.0)
         self.cal_frame_burst_size = parser.getint('calibration','cal_frame_burst_size')
         self.cal_frame_interval = parser.getint('calibration','cal_frame_interval')
         self.gain_lock_interval = parser.getint('calibration','gain_lock_interval')     
