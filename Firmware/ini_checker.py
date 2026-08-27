@@ -385,6 +385,18 @@ def check_ini(parameters, en_hw_check=True):
         if float(cal_params['frac_cal_timeout_s']) <= 0:
             error_list.append("Fractional sample delay calibration timeout must be a positive number. Currently it is: '{0}' ".format(cal_params['frac_cal_timeout_s']))
 
+    if not chk_float(cal_params['stuck_cal_timeout_s']):
+        error_list.append("Stuck calibration watchdog timeout must be a positive number. Currently it is: '{0}' ".format(cal_params['stuck_cal_timeout_s']))
+    else:
+        if float(cal_params['stuck_cal_timeout_s']) <= 0:
+            error_list.append("Stuck calibration watchdog timeout must be a positive number. Currently it is: '{0}' ".format(cal_params['stuck_cal_timeout_s']))
+
+    if not chk_float(cal_params['resync_cooldown_s']):
+        error_list.append("USRP resync cooldown must be a positive number. Currently it is: '{0}' ".format(cal_params['resync_cooldown_s']))
+    else:
+        if float(cal_params['resync_cooldown_s']) <= 0:
+            error_list.append("USRP resync cooldown must be a positive number. Currently it is: '{0}' ".format(cal_params['resync_cooldown_s']))
+
     iq_adjust_amplitude_str = cal_params['iq_adjust_amplitude']
     iq_adjust_amplitude_str = iq_adjust_amplitude_str.split(',')
     iq_adjust_time_delay_str     = cal_params['iq_adjust_time_delay_ns']
