@@ -292,6 +292,16 @@ class delaySynchronizer():
         self.out_shmem_iface_iq = outShmemIface("delay_sync_iq",
                                  out_shmem_size,
                                  drop_mode = True)
+        # DEBUG (temporary): this interface's own drop-frame warning is
+        # silenced by outShmemIface's hardcoded default (ignore_frame_drop_warning
+        # = True in its __init__). Chasing a krakensdr_doa UI freeze where its
+        # consumer thread ends up permanently parked in wait_buff_free() with no
+        # exception anywhere in its own per-frame body -- i.e. this producer
+        # stops offering it a free buffer. Enabling the existing counter/warning
+        # here will show directly whether wait_buff_free() starts permanently
+        # returning "no buffer free" (drop) right when the freeze happens, or
+        # whether it's some other, subtler desync.
+        self.out_shmem_iface_iq.ignore_frame_drop_warning = False
         if not self.out_shmem_iface_iq.init_ok:
             self.logger.critical("Shared memory (IQ server) initialization failed, exiting..")
             return -1

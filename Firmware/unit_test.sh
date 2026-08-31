@@ -11,6 +11,10 @@ rm _testing/test_logs/*.html 2> /dev/NULL
 # Start unit test for the decimator module
 sudo python3 -W ignore -m unittest -v _testing/unit_test/test_decimator.py
 
+# Start unit test for the Hardware Controller's USRP resync watchdog --
+# pure-Python logic, no compiled binaries/shared memory/root needed
+python3 -W ignore -m unittest -v _testing/unit_test/test_hw_controller_resync.py
+
 # Start unit test for the squelch module
 #sudo python3 -W ignore -m unittest -v _testing/unit_test/test_squelch.py
 

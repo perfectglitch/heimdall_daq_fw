@@ -6,10 +6,13 @@
 #   Modeled on krakenrf's official install script:
 #     https://raw.githubusercontent.com/krakenrf/krakensdr_docs/main/install_scripts/krakensdr_x86_install_doa.sh
 #   but swaps the RTL-SDR/KrakenSDR acquisition path for USRP+HackRF, and
-#   ships a pre-built krakensdr_doa tree (util/bundled/krakensdr_doa.tar.gz)
-#   instead of git-cloning it, since the fix this fork needed
-#   (kraken_sdr_receiver.py's get_iq_online() int/ndarray crash) isn't
-#   upstream.
+#   ships a pre-built krakensdr_doa tree (unpacked and tracked at
+#   $HEIMDALL_DIR/util/bundled/krakensdr_doa, not a tarball, so fixes to it are versioned
+#   alongside the DAQ firmware and re-deployable via util/deploy_kraken.sh)
+#   instead of git-cloning it, since the fixes this fork needed there
+#   (kraken_sdr_receiver.py's get_iq_online() int/ndarray crash, plus several
+#   unguarded exceptions in the UI's fetch_dsp_data update loop that could
+#   silently freeze all live updates) aren't upstream.
 #
 #   Prerequisite: this script must be run from within an ALREADY
 #   USRP-patched heimdall_daq_fw checkout (i.e. Firmware/_daq_core/usrp_daq.cc,
@@ -165,14 +168,15 @@ conda install -y numba==0.56.4
 conda install -y -c numba icc_rt
 
 #############################################
-# 4. Unpack the bundled krakensdr_doa tree
+# 4. Copy the krakensdr_doa tree (tracked unpacked at $HEIMDALL_DIR/util/bundled/krakensdr_doa,
+#    not as a tarball, so local fixes to it are versioned alongside the DAQ
+#    firmware and re-deployable via util/deploy_kraken.sh)
 #############################################
 if [ -d "$KRAKENSDR_DOA_DIR" ]; then
     echo "WARN: $KRAKENSDR_DOA_DIR already exists, leaving it in place (not overwriting)"
 else
     mkdir -p "$PARENT_DIR"
-    tar xzf "$SCRIPT_DIR/bundled/krakensdr_doa.tar.gz" -C "$PARENT_DIR"
-    mv "$PARENT_DIR/krakensdr_doa-main" "$KRAKENSDR_DOA_DIR"
+    cp -r "$HEIMDALL_DIR/util/bundled/krakensdr_doa" "$KRAKENSDR_DOA_DIR"
 fi
 
 mkdir -p "$KRAKENSDR_DOA_DIR/_share/logs/krakensdr_doa" "$KRAKENSDR_DOA_DIR/_share/logs/heimdall_daq_fw"

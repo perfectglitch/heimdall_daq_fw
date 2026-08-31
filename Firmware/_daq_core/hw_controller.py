@@ -483,6 +483,71 @@ class HWC():
 
             self.current_state = "STATE_NOISE_CTR_WAIT"
 
+    def _update_resync_watchdog(self):
+        """
+            Detects two USRP failure modes from self.iq_header's sync_state
+            stream and requests a resync from usrp_daq.cc when either is seen:
+
+            1) Track lock lost (sync_state dropped from 6) without an
+               explicit frequency change -- "calibration expired".
+            2) Calibration that never converges to track lock at all within
+               stuck_cal_timeout_s (e.g. a marginal correlation dynamic range
+               that occasionally clears the per-channel threshold but never
+               for every channel in the same pass).
+
+            A live retune in usrp_daq.cc can overflow a USRP's buffer and
+            permanently desync channels; a full stop/close/reopen recovers it
+            (see usrp_daq.cc's ZMQ 'y' handler). This uses the dedicated 'y'
+            command, not a same-frequency 'c' -- that was tried first and
+            confirmed live to misfire (the web UI sends its configured
+            frequency as an ordinary 'c' on every connect, including right
+            after a fresh boot, which routinely matches the current frequency
+            too). An explicit frequency change already triggers its own
+            recovery (the 'c' handler's timed-retune path), so case 1 only
+            fires when the drop out of track happened WITHOUT one (center
+            frequency unchanged since the last frame), to avoid doing both
+            back-to-back.
+
+            Both cases share resync_cooldown_s so a persistent fault can't
+            retrigger the recovery (itself not free -- it briefly drives
+            every channel into overdrive, and has been observed to crash the
+            box when repeated too soon) more often than that.
+
+            USRP-only; a no-op for other backends.
+        """
+        if self.backend != 'usrp':
+            return
+
+        now = monotonic()
+
+        lost_track = (self.last_sync_state == 6 and self.iq_header.sync_state != 6
+                      and self.iq_header.rf_center_freq == self.last_rf_center_freq)
+
+        if self.iq_header.sync_state >= 5 or self.iq_header.rf_center_freq != self.last_rf_center_freq:
+            self.stuck_cal_start_time = None
+        elif self.stuck_cal_start_time is None:
+            self.stuck_cal_start_time = now
+        stuck = (self.stuck_cal_start_time is not None
+                 and (now - self.stuck_cal_start_time) > self.stuck_cal_timeout_s)
+
+        if lost_track or stuck:
+            if self.last_resync_time is None or (now - self.last_resync_time) > self.resync_cooldown_s:
+                reason = "Track lock lost" if lost_track else \
+                    "Calibration stuck -- no track lock within {:.0f}s".format(self.stuck_cal_timeout_s)
+                self.logger.warning("{:s} -- requesting USRP resync at {:d} Hz".format(
+                    reason, self.iq_header.rf_center_freq))
+                msg_byte_array = inter_module_messages.pack_msg_resync(self.module_identifier)
+                self.rtl_daq_socket.send(msg_byte_array)
+                reply = self.rtl_daq_socket.recv()
+                self.logger.debug(f"Received reply: {reply}")
+                self.last_resync_time = now
+                self.stuck_cal_start_time = None
+            else:
+                self.logger.debug("Resync needed but suppressed by cooldown ({:.0f}s remaining)".format(
+                    self.resync_cooldown_s - (now - self.last_resync_time)))
+
+        self.last_sync_state = self.iq_header.sync_state
+        self.last_rf_center_freq = self.iq_header.rf_center_freq
 
     def start(self):
         """
@@ -533,31 +598,10 @@ class HWC():
                     if(self.iq_header.adc_overdrive_flags & 1<<m):
                         self.logger.warning("Overdrive ch {:d} [{:d}]".format(m, self.iq_header.cpi_index))
 
-                # -> Detect calibration expiration (track lock lost without an
-                #    explicit frequency change) and ask usrp_daq.cc to resync --
-                #    a live retune there can overflow a USRP's buffer and
-                #    permanently desync channels; a full stop/close/reopen
-                #    recovers it (see usrp_daq.cc's ZMQ 'y' handler). Uses the
-                #    dedicated 'y' command, not a same-frequency 'c' -- that
-                #    was tried first and confirmed live to misfire (this web
-                #    UI sends its configured frequency as an ordinary 'c' on
-                #    every connect, which routinely matches current frequency
-                #    too, triggering an unwanted reopen right after a fresh
-                #    boot). An explicit frequency change already triggers its
-                #    own recovery (the 'c' handler's timed-retune path), so
-                #    only fire here when the drop out of track happened
-                #    WITHOUT one (center frequency unchanged since the last
-                #    frame) to avoid doing both back-to-back.
-                if self.backend == 'usrp' \
-                   and self.last_sync_state == 6 and self.iq_header.sync_state != 6 \
-                   and self.iq_header.rf_center_freq == self.last_rf_center_freq:
-                    self.logger.warning("Track lock lost -- requesting USRP resync at {:d} Hz".format(self.iq_header.rf_center_freq))
-                    msg_byte_array = inter_module_messages.pack_msg_resync(self.module_identifier)
-                    self.rtl_daq_socket.send(msg_byte_array)
-                    reply = self.rtl_daq_socket.recv()
-                    self.logger.debug(f"Received reply: {reply}")
-                self.last_sync_state = self.iq_header.sync_state
-                self.last_rf_center_freq = self.iq_header.rf_center_freq
+                # -> Detect calibration expiration (track lock lost) or
+                #    calibration that never converges at all, and resync if so.
+                #    See _update_resync_watchdog()'s docstring for the details.
+                self._update_resync_watchdog()
 
                 #
                 #------------------------------------------>
@@ -810,4 +854,4 @@ if __name__ == "__main__":
     if HWC_inst0.init() == 0:
         HWC_inst0.start()
 
-HWC_inst0.close()
+    HWC_inst0.close()
