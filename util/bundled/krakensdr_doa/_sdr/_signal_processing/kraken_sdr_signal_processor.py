@@ -206,6 +206,19 @@ class SignalProcessor(threading.Thread):
         self.auto_vfo_exclude_offset_hz = 0
         self.auto_vfo_exclude_width_hz = 0
 
+        # A chirp-modulated signal (e.g. LoRa) spreads its energy roughly
+        # uniformly across its whole swept bandwidth, so the single
+        # strongest FFT bin at any one capture can legitimately sit near
+        # either edge of the chirp rather than its center -- plain argmax
+        # then parks the VFO there instead of on the signal. Auto Max
+        # instead walks outward from the peak while power stays within
+        # auto_vfo_region_drop_db of it, and snaps to the center of that
+        # contiguous region. auto_vfo_region_max_width_hz bounds how far
+        # that walk can go, so a flat/noisy spectrum with no real
+        # rolloff can't expand the "region" across the whole band.
+        self.auto_vfo_region_drop_db = 6.0
+        self.auto_vfo_region_max_width_hz = 600000
+
         # self.DOA_theta =  np.linspace(0,359,360)
         self.spectrum = None  # np.ones((self.channel_number+2,N), dtype=np.float32)
         self.peak_hold_spectrum = np.ones(self.spectrum_window_size) * -200
@@ -261,6 +274,17 @@ class SignalProcessor(threading.Thread):
         self.snrs = []
         self.dropped_frames = 0
 
+        # Raw-frame capture for offline DOA diagnosis (see start_frame_dump/
+        # _flush_frame_dump): dumps the per-VFO channelized multi-channel IQ
+        # plus the spatial correlation matrix actually fed to the DOA
+        # algorithm, one entry per processed frame, for N frames on request.
+        self.R = None
+        self.frame_dump_remaining = 0
+        self.frame_dump_records = []
+        self.frame_dump_status = {"state": "idle"}
+        self.frame_dump_dir = os.path.join(shared_path, "records", "doa_frames")
+        Path(self.frame_dump_dir).mkdir(parents=True, exist_ok=True)
+
     @property
     def vfo_demod_modes(self):
         vfo_demod = [self.vfo_default_demod] * self.max_vfos
@@ -296,6 +320,37 @@ class SignalProcessor(threading.Thread):
                 auto_squelch = is_enabled_auto_squelch(self.vfo_squelch_mode[i])
                 if auto_squelch:
                     self.vfo_squelch[i] = vfo_auto_squelch
+
+    def find_high_gain_region_center(self, search_spec, freqs, peak_index):
+        """
+            Auto Max VFO helper: given a dB-scale spectrum and its peak bin,
+            returns the frequency at the center of the contiguous region
+            around that peak whose power stays within
+            self.auto_vfo_region_drop_db of it (bounded by
+            self.auto_vfo_region_max_width_hz on each side). For a narrow
+            spike this collapses back to the peak's own frequency; for a
+            chirp-modulated signal (energy spread roughly uniformly across
+            its swept bandwidth) it centers on the occupied band instead of
+            wherever the single strongest instantaneous bin happened to
+            land -- which can otherwise sit right at the edge of the sweep.
+        """
+        peak_val = search_spec[peak_index]
+        threshold = peak_val - self.auto_vfo_region_drop_db
+        n = len(search_spec)
+        peak_freq = freqs[peak_index]
+
+        lo = peak_index
+        while lo > 0 and search_spec[lo - 1] >= threshold \
+                and abs(freqs[lo - 1] - peak_freq) <= self.auto_vfo_region_max_width_hz:
+            lo -= 1
+        hi = peak_index
+        while hi < n - 1 and search_spec[hi + 1] >= threshold \
+                and abs(freqs[hi + 1] - peak_freq) <= self.auto_vfo_region_max_width_hz:
+            hi += 1
+
+        if hi == lo:
+            return peak_freq
+        return 0.5 * (freqs[lo] + freqs[hi])
 
     def calculate_squelch(self, sampling_freq, N, measured_spec, real_freqs):
         def find_nearest(array, value):
@@ -555,7 +610,7 @@ class SignalProcessor(threading.Thread):
                                             if not excluded.all():  # never blank out every bin
                                                 search_spec = np.where(excluded, -200, search_spec)
                                         max_index = search_spec.argmax()
-                                        freq = self.spectrum[0, max_index]
+                                        freq = self.find_high_gain_region_center(search_spec, self.spectrum[0, :], max_index)
                                         self.vfo_freq[i] = freq + self.module_receiver.daq_center_freq
 
                                     decimation_factor = max(
@@ -653,6 +708,9 @@ class SignalProcessor(threading.Thread):
 
                                         doa_result_log = DOA_plot_util(self.DOA)
                                         conf_val = calculate_doa_papr(self.DOA)
+
+                                        if self.frame_dump_remaining > 0:
+                                            self._record_frame_dump(vfo_channel, write_freq, theta_0, conf_val)
 
                                         self.doa_max_list[i] = theta_0
                                         update_list[i] = True
@@ -1040,6 +1098,10 @@ class SignalProcessor(threading.Thread):
                 pass
 
         M = R.shape[0]
+        # Stashed for start_frame_dump() -- the actual matrix fed to the DOA
+        # algorithm below (post spatial-averaging/decorrelation), not just
+        # the raw sample covariance.
+        self.R = R
 
         # If rank of the correlation matrix is not equal to its full one,
         # then we are likely dealing with correlated sources and (or) low SNR signals
@@ -1114,6 +1176,70 @@ class SignalProcessor(threading.Thread):
             theta_0 = self.DOA_theta[np.argmax(self.DOA)]
 
         return theta_0
+
+    def start_frame_dump(self, n_frames):
+        """
+        Arms capture of the next n_frames processed VFO frames (per-channel
+        channelized IQ + the spatial correlation matrix actually fed to the
+        DOA algorithm, plus the resulting angle/confidence/frequency) for
+        offline analysis -- e.g. to see directly whether a channel's phase
+        is unstable, or whether the tracked frequency itself is jumping,
+        while physically moving a test source. Safe to call while another
+        dump is in progress; restarts it.
+        """
+        self.frame_dump_records = []
+        self.frame_dump_remaining = max(int(n_frames), 1)
+        self.frame_dump_status = {"state": "capturing", "remaining": self.frame_dump_remaining}
+
+    def _record_frame_dump(self, vfo_channel, vfo_freq, theta_0, conf_val):
+        self.frame_dump_records.append(
+            {
+                "timestamp": time.time(),
+                "vfo_freq": vfo_freq,
+                "theta_0": float(theta_0),
+                "confidence": float(np.max(conf_val)),
+                "processed_signal": np.array(vfo_channel, copy=True),
+                "R": np.array(self.R, copy=True) if self.R is not None else None,
+            }
+        )
+        self.frame_dump_remaining -= 1
+        self.frame_dump_status = {"state": "capturing", "remaining": self.frame_dump_remaining}
+        if self.frame_dump_remaining <= 0:
+            self._flush_frame_dump()
+
+    def _flush_frame_dump(self):
+        records = self.frame_dump_records
+        self.frame_dump_records = []
+        if not records:
+            self.frame_dump_status = {"state": "error", "message": "no frames captured"}
+            return
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"doa_frames_{ts}.npz"
+        path = os.path.join(self.frame_dump_dir, filename)
+        try:
+            np.savez_compressed(
+                path,
+                timestamp=np.array([r["timestamp"] for r in records]),
+                vfo_freq=np.array([r["vfo_freq"] for r in records]),
+                theta_0=np.array([r["theta_0"] for r in records]),
+                confidence=np.array([r["confidence"] for r in records]),
+                # Frames can differ in channelized length frame-to-frame
+                # (decimation is source-rate dependent) -- store as an
+                # object array rather than assuming a fixed shape.
+                processed_signal=np.array([r["processed_signal"] for r in records], dtype=object),
+                R=np.array([r["R"] for r in records], dtype=object),
+            )
+        except Exception:
+            self.logger.exception("frame dump: failed to write %s", path)
+            self.frame_dump_status = {"state": "error", "message": "failed to write dump file, see server log"}
+            return
+        self.frame_dump_status = {
+            "state": "done",
+            "n_frames": len(records),
+            "path": path,
+            "share_url": f"/records/doa_frames/{filename}",
+        }
+        self.logger.info("frame dump: wrote %d frames to %s", len(records), path)
 
     # Enable GPS
     def enable_gps(self):

@@ -91,3 +91,26 @@ async def api_sweep():
             "result": web_interface.sweep_result,
         }
     )
+
+
+@app.server.route("/api/doa/dump", methods=["GET", "POST"])
+async def api_doa_dump():
+    # POST {"n_frames": N} arms capture of the next N processed VFO frames
+    # (per-channel channelized IQ + the DOA algorithm's own correlation
+    # matrix + resulting angle/confidence/frequency) to an .npz file under
+    # _share/records/doa_frames/ -- reachable over the existing PHP static
+    # file server on :8081 (share_url in the GET response, once done) without
+    # any extra code, same as everything else already served from _share.
+    # For diagnosing "DOA looks fine on a static source but goes random when
+    # moved" -- capture N frames spanning a physical move of the source, then
+    # check offline whether it's the tracked frequency jumping (vfo_freq
+    # column) or the per-channel phase relationships in `processed_signal`/`R`
+    # themselves becoming unstable.
+    sp = web_interface.module_signal_processor
+    if request.method == "POST":
+        body = await request.get_json(silent=True) or {}
+        n_frames = int(body.get("n_frames", 100))
+        sp.start_frame_dump(n_frames)
+        return jsonify({"started": True, "status": sp.frame_dump_status}), 202
+
+    return jsonify(sp.frame_dump_status)

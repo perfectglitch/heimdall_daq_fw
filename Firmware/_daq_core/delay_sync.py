@@ -136,8 +136,6 @@ class delaySynchronizer():
         self.sync_failed_cntr_total = 0
 
         self.MIN_FS_PPM_OFFSET = 0.0000001
-        self.MAX_FS_PPM_OFFSET = 0.01
-        self.INT_FS_TUNE_GAIN  = np.array([[100, 2, 0],[50, 25, 15]]) #Reference table for tuning - [Delay limits] [Tune gains]
         self.FRAC_FS_TUNE_GAIN = 20
         
         # Auxiliary state variables
@@ -577,7 +575,6 @@ class delaySynchronizer():
                     sync_state        = 2
                     sample_sync_flag  = True
                     delay_update_flag = 0
-                    fs_ppm_offsets=[0]*self.M 
 
                     # ->  Calculate correlation functions
                     np_zeros = np.zeros(self.N_proc, dtype=np.complex64)
@@ -639,20 +636,22 @@ class delaySynchronizer():
                             break
                         
                         # Calculate sample offset
-                        self.delays[m] = (self.N_proc - peak_index)                              
-                        fs_tune_gain_m = (self.INT_FS_TUNE_GAIN[1,(self.INT_FS_TUNE_GAIN[0,:] <= abs(self.delays[m]))])[0]      
-                        fs_ppm_offsets[m] = -1*self.delays[m] * fs_tune_gain_m * self.MIN_FS_PPM_OFFSET                        
-                        if abs(fs_ppm_offsets[m]) > self.MAX_FS_PPM_OFFSET:
-                            fs_ppm_offsets[m] = np.sign(fs_ppm_offsets[m])*self.MAX_FS_PPM_OFFSET                        
+                        self.delays[m] = (self.N_proc - peak_index)
 
                         if np.abs(self.delays[m]) >= 1:
                             sample_sync_flag = False # Misalling detected
                             delay_update_flag=1
-                        self.logger.debug("Channel {:d}, delay: {:d}, tune gain: {:d} ppm-offset: {:.7f}, ".format(m, self.delays[m], fs_tune_gain_m, fs_ppm_offsets[m]))
+                        self.logger.debug("Channel {:d}, delay: {:d}".format(m, self.delays[m]))
 
-                    # Set time delay 
+                    # Set time delay -- sent as the raw measured sample count
+                    # (see pack_msg_sample_skip) for a one-shot bulk skip on
+                    # the receiving end, not walked off 1 sample/cycle: a
+                    # USRP's PPS-slaved devices can show a one-time startup
+                    # misalignment of thousands of samples, and this
+                    # correlation measurement (post dynamic-range check above)
+                    # is already trustworthy at that magnitude.
                     if delay_update_flag:
-                        msg_byte_array = inter_module_messages.pack_msg_sample_freq_tune(self.module_identifier, fs_ppm_offsets)
+                        msg_byte_array = inter_module_messages.pack_msg_sample_skip(self.module_identifier, self.delays.tolist())
                         self.rtl_daq_socket.send(msg_byte_array)
                         reply = self.rtl_daq_socket.recv()
                         self.logger.debug(f"Received reply: {reply}")
@@ -745,11 +744,19 @@ class delaySynchronizer():
                             iq_sync_flag = False
                             iq_corr_update_flag = False                            
                            
-                        # Check IQ calibration necessity
-                        elif (abs(np.rad2deg(np.angle(iq_diffs[m]))) > self.phase_diff_tolerance) or \
-                             (abs(iq_diffs[m]) > self.amp_diff_tolerance):  
+                        # Check IQ calibration necessity across all channels --
+                        # not just channel m, which by this point is a stale
+                        # leftover from STATE_FRAC_SAMPLE_CAL's own "for m in
+                        # range(self.M-1)" loop several states back (Python
+                        # doesn't scope for-loop variables to the loop). A
+                        # single fixed, arbitrary channel index was being
+                        # checked every cycle instead of scanning all of
+                        # them -- matches STATE_TRACK's equivalent check just
+                        # below, which already uses this any()-based pattern.
+                        elif (np.abs(np.rad2deg(np.angle(iq_diffs))) > self.phase_diff_tolerance).any() or \
+                             (np.abs(iq_diffs) > self.amp_diff_tolerance).any():
                             iq_corr_update_flag = True
-                            self.logger.debug("Amplitude or phase differenceas are out of tolerance")                        
+                            self.logger.debug("Amplitude or phase differenceas are out of tolerance")
                         
                         # Update correction values if needed                
                         if iq_corr_update_flag:

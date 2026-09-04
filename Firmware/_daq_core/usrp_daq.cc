@@ -19,6 +19,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -408,6 +409,75 @@ static long new_center_freq = 0;
 // (ERROR_CODE_LATE_COMMAND, then a hang needing a manual SIGKILL). A
 // same-frequency 'c'/'r' is now a no-op; only this flag forces a resync.
 static int resync_requested_flag = 0;
+
+// Stall self-recovery: a reader thread that gets nothing but empty recv()s
+// (observed live after a retune-induced Overflow + ERROR_CODE_LATE_COMMAND,
+// but not exclusive to that trigger) never advances its buff_ind, so the
+// main loop's `ready` predicate can never become true again and
+// hw_controller.py's own resync watchdog never gets a new frame to run its
+// per-frame check against -- the whole pipeline just sits frozen forever
+// with nothing left to detect or fix it. request_stall_resync() (called
+// from reader_thread_entry on a run of consecutive empty recvs) sets this
+// same resync_requested_flag directly instead, so the main loop's early,
+// unconditional check picks it up independent of `ready`.
+//
+// Cooldown is exponential-backoff, not a flat delay: a fixed short cooldown
+// let this resync itself every ~30s in practice, immediately re-hitting
+// ERROR_CODE_LATE_COMMAND on both devices right after each reopen (the
+// "back-to-back reopens wedge devices" failure mode already called out
+// above) -- 3.5+ minutes straight of that, never actually recovering.
+// consecutive_stall_resyncs resets after STALL_RESYNC_STABLE_RESET_S of no
+// further stalls, so a transient fault doesn't leave the backoff
+// permanently long.
+static std::chrono::steady_clock::time_point last_stall_resync_time{};
+static int consecutive_stall_resyncs = 0;
+#define STALL_RECV_TIMEOUT_COUNT 10 // consecutive empty recv()s (~STALL_RECV_TIMEOUT_COUNT * RECV_TIMEOUT_S) before considering a stall
+#define STALL_RESYNC_BASE_COOLDOWN_S 30.0
+#define STALL_RESYNC_MAX_COOLDOWN_S 300.0 // matches daq_chain_config.ini's [calibration] resync_cooldown_s
+#define STALL_RESYNC_STABLE_RESET_S 360.0
+
+static void request_stall_resync(int dev_idx, int consecutive_empty_recvs)
+{
+    bool triggered = false;
+    double cooldown_remaining_s = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(buff_ind_mutex);
+        auto now = std::chrono::steady_clock::now();
+        double since_last_s = last_stall_resync_time.time_since_epoch().count() == 0
+            ? 1e18 // never yet -- treat as "long enough ago", not zero
+            : std::chrono::duration<double>(now - last_stall_resync_time).count();
+        if (since_last_s >= STALL_RESYNC_STABLE_RESET_S)
+            consecutive_stall_resyncs = 0;
+        double required_cooldown_s = std::min(
+            STALL_RESYNC_BASE_COOLDOWN_S * std::pow(2.0, consecutive_stall_resyncs),
+            STALL_RESYNC_MAX_COOLDOWN_S);
+        if (since_last_s >= required_cooldown_s)
+        {
+            resync_requested_flag = 1;
+            last_stall_resync_time = now;
+            consecutive_stall_resyncs++;
+            triggered = true;
+        }
+        else
+        {
+            cooldown_remaining_s = required_cooldown_s - since_last_s;
+        }
+    }
+    if (triggered)
+    {
+        log_warn("USRP %d: %d consecutive empty recv()s -- requesting stall resync "
+                 "(backoff attempt #%d, next cooldown starts at %.0fs)",
+                 dev_idx, consecutive_empty_recvs, consecutive_stall_resyncs,
+                 std::min(STALL_RESYNC_BASE_COOLDOWN_S * std::pow(2.0, consecutive_stall_resyncs), STALL_RESYNC_MAX_COOLDOWN_S));
+        buff_ind_cond.notify_all();
+    }
+    else
+    {
+        log_warn("USRP %d: %d consecutive empty recv()s, stall resync suppressed by backoff (%.0fs remaining)",
+                 dev_idx, consecutive_empty_recvs, cooldown_remaining_s);
+    }
+}
+
 static int gain_change_flag = 0;
 static std::vector<int> new_gains;
 static int noise_source_state = 0;
@@ -519,6 +589,14 @@ static void pps_sync_and_start_streams()
         for (int d = 1; d < n_active_devs; d++)
             usrp_devs[d].usrp->set_time_source("external");
 
+        // Note: this hardware shares a common reference clock via a direct
+        // wire + custom FPGA modification (not UHD's normal clock_source
+        // API / REF IN SMA path) -- the FPGA locks to it transparently
+        // regardless of software clock_source, so there's deliberately no
+        // set_clock_source()/"ref_locked" call here. (An attempt to add one
+        // was reverted after confirming the shared clock is already forced
+        // at the FPGA level.)
+
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         for (int d = 0; d < n_active_devs; d++)
             usrp_devs[d].usrp->set_time_next_pps(uhd::time_spec_t(0.0));
@@ -534,7 +612,7 @@ static void pps_sync_and_start_streams()
                 log_warn("Large time skew on USRP %d - check PPS wiring from USRP 0", d);
         }
         stream_cmd.stream_now = false;
-        stream_cmd.time_spec = uhd::time_spec_t(3.0);
+        stream_cmd.time_spec = uhd::time_spec_t(5.0);
     }
     for (int d = 0; d < n_active_devs; d++)
     {
@@ -578,6 +656,13 @@ static bool open_and_configure_device(int d, long freq)
     for (int c = 0; c < dev.num_ch; c++)
     {
         dev.usrp->set_rx_freq(make_tune_request((double) freq), c);
+        // Diagnostic: even with a shared LO/sample clock, each board tunes
+        // its own synthesizer independently -- if the achieved frequency
+        // differs by a fraction of a Hz between devices for the "same"
+        // requested frequency (PLL/NCO tuning-word quantization), that
+        // alone is enough to produce the slow inter-device phase drift
+        // seen in DOA output. High precision to catch sub-Hz differences.
+        log_info("USRP %d ch %d: requested %.3f Hz, achieved %.6f Hz", d, c, (double) freq, dev.usrp->get_rx_freq(c));
         try { dev.usrp->set_rx_dc_offset(true, c); } catch (const uhd::exception& e) {
             log_warn("USRP %d ch %d: set_rx_dc_offset not supported: %s", d, c, e.what());
         }
@@ -677,6 +762,12 @@ static bool restart_usrp_devices(long new_center_freq_hz)
             for (int d = 0; d < n_active_devs; d++)
                 usrp_devs[d].buff_ind = 0;
         }
+        // A fresh PPS sync below produces a new, unrelated alignment offset --
+        // any skip debt measured against the *previous* stream is stale and
+        // would otherwise make the new reader thread discard samples for no
+        // reason the instant it starts.
+        for (int slot = 0; slot < MAX_USRP; slot++)
+            align_skip_samples[slot].store(0);
 
         pps_sync_and_start_streams();
         running.store(true);
@@ -709,10 +800,24 @@ static void reader_thread_entry(int dev_idx)
     int nch = dev.num_ch;
     uhd::rx_metadata_t meta;
     int applied_skip = 0; // how much of align_skip_samples[dev.slot] this thread has discarded so far
+    int consecutive_empty_recvs = 0; // see request_stall_resync()
+
+    // Fixed-size, allocated once up front: the discard path below must never
+    // heap-allocate on demand. This thread runs at real-time priority
+    // (set_thread_priority_safe() above); a per-skip std::vector allocation
+    // sized to the full (now potentially thousands-of-samples) skip amount
+    // was observed live to reliably trigger a genuine USRP-side Overflow +
+    // LATE_COMMAND on the *other* device within ~1-2s of every 'k'-triggered
+    // skip -- a heap allocation stalling one real-time reader thread is
+    // enough to starve its sibling of CPU on a constrained core count. Discard
+    // in bounded chunks against a reused buffer instead.
+    const int DISCARD_CHUNK = 4096;
+    std::vector<std::complex<int16_t>> discard_scratch((size_t) nch * DISCARD_CHUNK);
+    std::vector<void*> discard_ptrs(nch);
 
     while (running.load())
     {
-        // Discard forward by however much the 's' command handler has
+        // Discard forward by however much the 'k' command handler has
         // incremented align_skip_samples[dev.slot] since we last checked --
         // see that handler's comment for why/how this converges. Applying
         // it here (top of the fill loop, between whole CPI blocks) means it
@@ -721,17 +826,26 @@ static void reader_thread_entry(int dev_idx)
         if (target_skip > applied_skip)
         {
             int to_skip = target_skip - applied_skip;
-            std::vector<std::complex<int16_t>> scratch((size_t) nch * to_skip);
-            std::vector<void*> ptrs(nch);
             int skipped = 0;
+            int n_calls = 0;
+            auto t_discard_start = std::chrono::steady_clock::now();
             while (skipped < to_skip && running.load())
             {
+                int chunk = std::min(DISCARD_CHUNK, to_skip - skipped);
                 for (int c = 0; c < nch; c++)
-                    ptrs[c] = scratch.data() + (size_t) c * to_skip + skipped;
-                size_t n = dev.rx_stream->recv(ptrs, to_skip - skipped, meta, 1.0);
+                    discard_ptrs[c] = discard_scratch.data() + (size_t) c * DISCARD_CHUNK;
+                auto t_call_start = std::chrono::steady_clock::now();
+                size_t n = dev.rx_stream->recv(discard_ptrs, (size_t) chunk, meta, 1.0);
+                double call_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_call_start).count();
+                n_calls++;
+                log_info("Discard[dev %d]: call %d requested %d got %zu in %.2fms, error_code=%d",
+                         dev_idx, n_calls, chunk, n, call_ms, (int) meta.error_code);
                 if (n == 0) break;
                 skipped += (int) n;
             }
+            double total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_discard_start).count();
+            log_info("Discard[dev %d]: finished, skipped %d/%d samples in %d calls, %.2fms total",
+                     dev_idx, skipped, to_skip, n_calls, total_ms);
             applied_skip += skipped;
         }
 
@@ -755,7 +869,17 @@ static void reader_thread_entry(int dev_idx)
                      meta.error_code != uhd::rx_metadata_t::ERROR_CODE_TIMEOUT)
                 log_warn("recv() error on USRP %d: %d", dev_idx, (int) meta.error_code);
 
-            if (n == 0) continue;
+            if (n == 0)
+            {
+                consecutive_empty_recvs++;
+                // Periodic recheck, not a one-shot latch: if request_stall_resync()
+                // suppressed this by cooldown, nothing else would ever clear a
+                // one-shot flag or retry once the cooldown expires.
+                if (consecutive_empty_recvs % STALL_RECV_TIMEOUT_COUNT == 0)
+                    request_stall_resync(dev_idx, consecutive_empty_recvs);
+                continue;
+            }
+            consecutive_empty_recvs = 0;
             filled += n;
         }
         if (!running.load()) break;
@@ -853,25 +977,41 @@ static void* zmq_control_thread(void*)
         }
         else if (msg.command_identifier == 's')
         {
-            // delay_sync.py's STATE_SAMPLE_CAL sends this with a per-channel
-            // ppm "correction" -- meaningless as an actual ppm trim for USRP
-            // (no free-running crystal to adjust, the clock is PPS-shared),
-            // but its SIGN and WHICH CHANNEL are exactly what we need: they
-            // encode delay_sync's own steady-state cross-correlation
+            // STATE_FRAC_SAMPLE_CAL's sub-sample residual -- genuinely a
+            // no-op for USRP: there's no free-running crystal to trim (the
+            // clock is PPS-shared), and a 1-sample skip would be a massive
+            // overshoot against a <1-sample target anyway. That residual is
+            // absorbed by STATE_IQ_CAL's phase correction instead. See
+            // frac_delay_tolerance's comment in delay_sync.py.
+        }
+        else if (msg.command_identifier == 'k')
+        {
+            // delay_sync.py's STATE_SAMPLE_CAL sends this with the raw,
+            // signed per-channel integer sample delay it just measured (see
+            // pack_msg_sample_skip) -- its own steady-state cross-correlation
             // measurement (corr_size samples, taken after proper
-            // calibration-gain tuning -- far more reliable than a one-shot
-            // measurement this process could do itself at startup). Reusing
-            // that measurement, a small forward-only sample skip is applied
-            // each cycle in the direction it indicates, converging over
-            // several of delay_sync's own retries (same closed loop it
-            // already runs, just with a working correction primitive).
+            // calibration-gain tuning, and already gated on a minimum
+            // dynamic range before being sent -- far more reliable than a
+            // one-shot measurement this process could do itself at startup).
+            // Applied as a single bulk skip, not walked off 1 sample/cycle:
+            // a USRP's PPS-slaved devices can show a one-time startup
+            // misalignment of thousands of samples (measured live: 1800-
+            // 19000+), and trickling that off 1 sample at a time either blew
+            // straight through an old implausibility ceiling tuned for
+            // "single digits to a few dozen samples" (rejecting every
+            // request outright) or would have taken hours to converge.
             //
-            // Sign convention (fs_ppm_offsets[m] = -delays[m] * gain, from
-            // delay_sync.py): offsets[m] > 0 means channel m is running
-            // early relative to the reference -> skip that channel's own
-            // device forward. offsets[m] < 0 means channel m is running
-            // late -> skip device 0 (the reference all channels are measured
-            // against) forward instead, letting it "catch up" to channel m.
+            // Sign convention (delays[m] = N_proc - peak_index, from
+            // delay_sync.py), confirmed empirically (the opposite mapping
+            // was tried first and diverged -- measured delay magnitude
+            // exactly doubled every cycle, 7556 -> 15112 -> 30224, since
+            // each "correction" pushed the misalignment further the same
+            // direction instead of canceling it): delays[m] < 0 means
+            // channel m is running late relative to the reference -> skip
+            // that channel's own device forward to catch up. delays[m] > 0
+            // means channel m is running early -> skip device 0 (the
+            // reference all channels are measured against) forward instead,
+            // letting it catch up to channel m.
             //
             // Deliberately NOT "skip every other device": delay_sync.py only
             // ever measures each channel against channel 0, never against
@@ -882,71 +1022,41 @@ static void* zmq_control_thread(void*)
             // other two" request gave devices 0 and 2 (say) the same net
             // skip as each other, leaving *their* relative alignment
             // unchanged despite corrections being sent every cycle.
-            //
-            // Only STATE_SAMPLE_CAL's *integer*-sample corrections should
-            // ever be applied here -- STATE_FRAC_SAMPLE_CAL sends this same
-            // command for its sub-sample residual, and a 1-sample skip is a
-            // massive overshoot against a <1-sample target every single
-            // time (that residual belongs to STATE_IQ_CAL's phase
-            // correction, not this mechanism, which can only move in whole
-            // samples). Both stages share this wire format with no state
-            // indicator, but their magnitudes don't overlap: comparing
-            // delay_sync.py's own gain tables, STATE_SAMPLE_CAL's smallest
-            // possible correction (delay=1 sample, gain=15) is
-            // 1*15*1e-7=1.5e-6, while STATE_FRAC_SAMPLE_CAL's largest
-            // plausible one (|taus|=0.5, gain=20) is 0.5*20*1e-7=1.0e-6 --
-            // so thresholding in that gap reliably tells them apart.
-            const float INTEGER_STAGE_MIN_PPM = 1.3e-6f;
-            // A USB overflow (real: happens under heavy downstream CPU/USB
-            // load, e.g. a client actively consuming full-rate data) drops
-            // samples on just the affected device, permanently shifting it
-            // out of alignment by an essentially random, potentially huge
-            // amount -- not a small fixed hardware offset. STEP=1 can't
-            // converge on that in any reasonable time (a several-hundred-
-            // sample jump would take minutes to hours), and chasing it is
-            // pointless anyway since post-overflow the two streams are
-            // genuinely discontinuous, not just shifted. ~400 samples
-            // (delay_sync.py's gain=50 bracket) is a generous ceiling above
-            // every legitimate one-time offset seen on this hardware so
-            // far (single digits to a few dozen samples) -- above it, log
-            // and wait for the next clean recalibration pass instead.
-            const float MAX_PLAUSIBLE_PPM = 0.002f;
-            const int STEP = 1; // samples per correction cycle -- small and monotonic, no overshoot risk
             int ref_dev_slot = usrp_devs[channel_to_dev[config.std_ch_ind]].slot;
             int ref_channel_dev = channel_to_dev[config.std_ch_ind];
-            float* offsets = (float*) msg.parameters;
+            int32_t* delays = (int32_t*) msg.parameters;
             // Multi-channel devices (e.g. a B210's 2 RX channels) are
             // sample-locked to each other, so their channels' measurements
             // against the reference agree and request the same correction
-            // in the same message. Collecting into a per-device flag first
-            // -- instead of fetch_add-ing once per channel below -- keeps
-            // each device's correction at exactly STEP per message; without
-            // this, a 2-channel device double-applies STEP every cycle,
-            // permanently overshooting its target by 1 sample and never
-            // converging (confirmed live: channels sharing a device
-            // oscillate delay +1/-1 forever instead of settling at 0).
-            bool dev_needs_skip[MAX_USRP] = {false};
+            // in the same message -- collect the largest magnitude seen per
+            // device instead of fetch_add-ing once per channel, so a
+            // 2-channel device doesn't double-apply the skip.
+            int dev_skip[MAX_USRP] = {0};
             for (int m = 0; m < ch_no; m++)
             {
-                float mag = std::fabs(offsets[m]);
-                if (mag < INTEGER_STAGE_MIN_PPM) continue; // fractional-stage request -- not ours to correct
-                if (mag > MAX_PLAUSIBLE_PPM)
+                int32_t delay = delays[m];
+                if (delay == 0) continue;
+                // Sanity bound against protocol/parsing corruption -- not a
+                // realistic-magnitude ceiling: delay_sync.py already gates
+                // this measurement on minimum correlation dynamic range
+                // before sending, and it's architecturally bounded by
+                // corr_size (peak_index in [0, 2*N_proc)) well under this.
+                if (std::abs(delay) > (1 << 20))
                 {
-                    log_warn("Channel %d: implausibly large correction requested (ppm=%.6f) -- "
-                             "likely a post-overflow discontinuity, not applying", m, offsets[m]);
+                    log_warn("Channel %d: implausible skip requested (%d samples) -- not applying", m, delay);
                     continue;
                 }
                 int d = channel_to_dev[m];
                 if (d == ref_channel_dev) continue; // same device as the reference channel -- not fixable by a device-level skip
-                if (offsets[m] > 0)
-                    dev_needs_skip[usrp_devs[d].slot] = true;
-                else
-                    dev_needs_skip[ref_dev_slot] = true;
+                int slot = (delay < 0) ? usrp_devs[d].slot : ref_dev_slot;
+                dev_skip[slot] = std::max(dev_skip[slot], std::abs((int) delay));
             }
             for (int slot = 0; slot < MAX_USRP; slot++)
-                if (dev_needs_skip[slot])
-                    align_skip_samples[slot].fetch_add(STEP);
-            log_info("Signal 's': applied incremental per-device alignment nudges");
+                if (dev_skip[slot] > 0)
+                {
+                    align_skip_samples[slot].fetch_add(dev_skip[slot]);
+                    log_info("Signal 'k': applied one-shot alignment skip of %d samples on slot %d", dev_skip[slot], slot);
+                }
         }
         else if (msg.command_identifier == 'n')
         {
@@ -1109,6 +1219,33 @@ int main(int argc, char** argv)
             return true;
         });
         if (exit_flag.load()) break;
+
+        // Checked here, unconditionally, before the `!ready` gate below --
+        // resync_requested_flag can now also be set by a reader thread's own
+        // stall detector (see request_stall_resync()), and `ready` requires
+        // every device's buff_ind to have advanced, which by construction
+        // can never happen during exactly the stall this flag exists to fix.
+        // Consolidated with the (still-possible) 'y'-triggered explicit
+        // resync request -- same flag, same recovery action either way.
+        if (resync_requested_flag)
+        {
+            resync_requested_flag = 0;
+            lock.unlock();
+            bool ok = restart_usrp_devices(current_center_freq);
+            if (!ok)
+            {
+                // restart_usrp_devices() already set exit_flag; re-lock
+                // before breaking so the unconditional lock.unlock() just
+                // after the loop (normal exit path) doesn't throw on a
+                // mutex it doesn't own.
+                lock.lock();
+                break;
+            }
+            lock.lock();
+            read_buff_ind = 0; // buff_ind was reset to 0 for every device above
+            log_info("Resynced at %ld Hz", current_center_freq);
+            continue; // re-evaluate from a clean state
+        }
         if (!ready) continue;
 
         // Leaky-queue catch-up: fwrite() below can block for a long time if
@@ -1227,13 +1364,11 @@ int main(int argc, char** argv)
          */
         bool do_freq_change = center_freq_change_flag;
         long local_new_center_freq = new_center_freq;
-        bool do_resync = resync_requested_flag;
         bool do_gain_change = gain_change_flag;
         std::vector<int> local_new_gains = new_gains;
         bool do_noise_toggle = (last_noise_source_state != noise_source_state) && config.en_noise_source_ctr;
         int local_noise_source_state = noise_source_state;
         center_freq_change_flag = 0;
-        resync_requested_flag = 0;
         gain_change_flag = 0;
         last_noise_source_state = noise_source_state;
 
@@ -1241,30 +1376,11 @@ int main(int argc, char** argv)
 
         // A 'c'/'r' request whose frequency matches current_center_freq is
         // deliberately a no-op (see resync_requested_flag's comment) --
-        // only do_resync forces the full reopen path, and only a genuine
-        // frequency difference triggers the timed-retune path.
-        if (do_resync)
-        {
-            // Explicit resync request (hw_controller.py: calibration
-            // expired without a frequency change). There's no tuning step
-            // to make hitless here; what's actually broken is buff_ind
-            // consistency across devices from some earlier discontinuity,
-            // and a full close/reopen is the only confirmed way to
-            // re-establish that (see restart_usrp_devices()'s comment).
-            bool ok = restart_usrp_devices(current_center_freq);
-            read_buff_ind = 0; // buff_ind was reset to 0 for every device above
-            if (!ok)
-            {
-                // restart_usrp_devices() already set exit_flag; re-lock
-                // before breaking so the unconditional lock.unlock() just
-                // after the loop (normal exit path) doesn't throw on a
-                // mutex it doesn't own.
-                lock.lock();
-                break;
-            }
-            log_info("Resynced at %ld Hz", current_center_freq);
-        }
-        else if (do_freq_change && local_new_center_freq != current_center_freq)
+        // resync_requested_flag itself is handled earlier, right after the
+        // bounded wait, since it must run even while !ready (see that
+        // check's comment); only a genuine frequency difference triggers
+        // the timed-retune path here.
+        if (do_freq_change && local_new_center_freq != current_center_freq)
         {
             // Genuine retune. A plain sequential set_rx_freq() per channel
             // (5 blocking calls, each waiting for its own LO lock) held up
