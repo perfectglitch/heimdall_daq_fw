@@ -38,6 +38,7 @@
 
 #include <zmq.h>
 
+#include <uhd/device.hpp>
 #include <uhd/exception.hpp>
 #include <uhd/usrp/multi_usrp.hpp>
 #include <uhd/utils/thread.hpp>
@@ -635,14 +636,90 @@ static void pps_sync_and_start_streams()
 // open_and_sync_devices() (first start, gain not live yet -> pass
 // config.gain there first) and restart_usrp_devices() (reopen with the
 // gain each channel already had).
+// Fallback for a confirmed UHD 4.9.0 bug: multi_usrp::make("serial=X,...")
+// throws LookupError/KeyError for at least one specific physical unit, even
+// though uhd::device::find() correctly lists that same serial (confirmed
+// live via direct uhd_usrp_probe testing -- find() sees it, make() with an
+// identical serial= string doesn't). Discovers all USB-connected b200-series
+// devices, matches by serial in application code, and builds a device_addr
+// from the OTHER properties (name/product/type) instead of serial.
+//
+// Only usable as a fallback, not the primary path: name/product alone
+// aren't guaranteed unique across units (e.g. two slots can share the same
+// name), so this validates the fallback address is unique among all
+// currently-found devices before trusting it -- otherwise it would risk
+// opening the WRONG physical unit for a given slot.
+static uhd::device_addr_t resolve_device_by_serial(const std::string& serial)
+{
+    uhd::device_addr_t hint;
+    hint["type"] = "b200";
+    uhd::device_addrs_t found = uhd::device::find(hint);
+
+    uhd::device_addr_t match;
+    bool match_found = false;
+    for (const auto& addr : found)
+    {
+        if (addr.has_key("serial") && addr["serial"] == serial)
+        {
+            match = addr;
+            match_found = true;
+            break;
+        }
+    }
+    if (!match_found)
+        throw uhd::lookup_error("resolve_device_by_serial: no device found with serial " + serial);
+
+    uhd::device_addr_t result;
+    for (const std::string key : {"name", "product", "type"})
+        if (match.has_key(key)) result[key] = match[key];
+
+    int matches = 0;
+    for (const auto& addr : found)
+    {
+        bool same = true;
+        for (const std::string key : {"name", "product", "type"})
+        {
+            std::string a = addr.has_key(key) ? addr[key] : "";
+            std::string b = result.has_key(key) ? result[key] : "";
+            if (a != b) { same = false; break; }
+        }
+        if (same) matches++;
+    }
+    if (matches != 1)
+        throw uhd::lookup_error("resolve_device_by_serial: fallback properties for " + serial +
+                                 " are ambiguous among " + std::to_string(matches) + " found devices");
+
+    return result;
+}
+
+// Tries the direct serial= open first (works for most units) and only
+// falls back to resolve_device_by_serial() if that throws a lookup error --
+// keeps the common case simple and fast, and only pays for the discovery
+// fallback on the one unit that actually needs it.
+static uhd::usrp::multi_usrp::sptr open_usrp(int slot)
+{
+    std::string addr = build_addr(slot);
+    try
+    {
+        return uhd::usrp::multi_usrp::make(uhd::device_addr_t(addr));
+    }
+    catch (const uhd::lookup_error&)
+    {
+        log_warn("Direct serial= open failed for slot %d (serial %s) -- falling back to "
+                 "discover-then-match-by-serial (known UHD 4.9.0 bug workaround)",
+                 slot, config.serial[slot]);
+        uhd::device_addr_t resolved = resolve_device_by_serial(config.serial[slot]);
+        return uhd::usrp::multi_usrp::make(resolved);
+    }
+}
+
 static bool open_and_configure_device(int d, long freq)
 {
     usrp_dev_struct& dev = usrp_devs[d];
-    std::string addr = build_addr(dev.slot);
-    log_info("Opening USRP %d (serial %s), args: %s", d, dev.serial.c_str(), addr.c_str());
+    log_info("Opening USRP %d (serial %s)", d, dev.serial.c_str());
     try
     {
-        dev.usrp = uhd::usrp::multi_usrp::make(uhd::device_addr_t(addr));
+        dev.usrp = open_usrp(dev.slot);
     }
     catch (const uhd::exception& e)
     {
