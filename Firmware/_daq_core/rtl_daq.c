@@ -199,29 +199,40 @@ void * fifo_read_tf(void* arg)
         /* Tuner reconfiguration request */
         if( msg->command_identifier == 'r')
         {
-            log_info("Signal 'r': Reconfiguring the tuner");            
-            uint32_t * parameters = (uint32_t * ) msg->parameters;
-            
-            log_info("Center freq: %u MHz", ((unsigned int) parameters[0]/1000000));
-            log_info("Sample rate: %u MSps", ((unsigned int) parameters[1]/1000000));
-            log_info("Gain: %d dB",(parameters[2]/10));
-            
+            log_info("Signal 'r': Reconfiguring the tuner");
+            /* center_freq is 8 byte (offset 0), sample_rate/gain are 4 byte
+             * each (offsets 8, 12) -- see pack_msg_reconfiguration(). RTL-SDR
+             * itself only tunes up to ~1.7GHz, but the wire format is shared
+             * with usrp_daq.c, whose frequencies don't fit in 4 bytes (e.g.
+             * 5.8GHz), so this side has to parse the same 8-byte layout even
+             * though it will only ever see small values here. memcpy instead
+             * of a pointer cast: msg->parameters isn't 8-byte aligned within
+             * hdaq_im_msg_struct (2 single-byte fields precede it). */
+            uint64_t freq_u64; memcpy(&freq_u64, msg->parameters, sizeof(freq_u64));
+            uint32_t sample_rate_u32; memcpy(&sample_rate_u32, msg->parameters + 8, sizeof(sample_rate_u32));
+            uint32_t gain_u32; memcpy(&gain_u32, msg->parameters + 12, sizeof(gain_u32));
+
+            log_info("Center freq: %u MHz", ((unsigned int) (freq_u64/1000000)));
+            log_info("Sample rate: %u MSps", ((unsigned int) sample_rate_u32/1000000));
+            log_info("Gain: %d dB",(gain_u32/10));
+
             for(int i=0; i<ch_no; i++)
-            {              
-              rtl_receivers[i].gain = (int) parameters[2];
-              rtl_receivers[i].center_freq = parameters[0];
-              rtl_receivers[i].sample_rate = parameters[1];
+            {
+              rtl_receivers[i].gain = (int) gain_u32;
+              rtl_receivers[i].center_freq = (int) freq_u64;
+              rtl_receivers[i].sample_rate = sample_rate_u32;
             }
             reconfig_trigger=1;
         }
         /* Center Frequency Tuning */
         else if (msg->command_identifier == 'c')
         {
-            log_info("Signal 'c': Center frequency tuning request");            
-            uint32_t * parameters = (uint32_t * ) msg->parameters;            
-            new_center_freq = parameters[0];
+            log_info("Signal 'c': Center frequency tuning request");
+            /* 8 byte, not 4 -- see the 'r' handler's comment above. */
+            uint64_t freq_u64; memcpy(&freq_u64, msg->parameters, sizeof(freq_u64));
+            new_center_freq = (uint32_t) freq_u64;
             center_freq_change_flag = 1;
-            log_info("New center frequency: %u MHz", ((unsigned int) parameters[0]/1000000));
+            log_info("New center frequency: %u MHz", ((unsigned int) (freq_u64/1000000)));
         }
         /* Gain tuning*/
         else if( msg->command_identifier == 'g')

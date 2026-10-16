@@ -23,6 +23,7 @@
 from struct import pack, unpack
 import threading
 import logging
+from time import monotonic
 
 # Import third-party modules
 import numpy as np
@@ -43,20 +44,34 @@ class HWC():
     
     def __init__(self):                 
         
-        logging.basicConfig(level=10)
+        # Root logger stays at WARNING -- this module's own verbosity is set
+        # further down via self.logger.setLevel(self.log_level) from the ini.
+        # Setting the root logger to DEBUG here would also make third-party
+        # loggers spew unrelated verbose output.
+        logging.basicConfig(level=logging.WARNING)
         self.logger = logging.getLogger(__name__)
-        self.log_level=0 # Set from the ini file        
+        self.log_level=0 # Set from the ini file
         self.module_identifier = 6 # Inter-module message module identifier
         self.track_lock_ctr_fname = "_data_control/iq_track_lock"
         self.track_lock_ctr_fd = None
         self.in_shmem_iface = None
+        self.backend = "rtlsdr" # Overwritten from [hw] backend in the ini ("rtlsdr" | "usrp")
         # Gain index:       0  1   2   3   4   5   6    7    8    9   10   11   12   13   14   15   16   17   18   19   20   21   22   23   24   25   26   27   28
-        self.valid_gains = [0, 9, 14, 27, 37, 77, 87, 125, 144, 157, 166, 197, 207, 229, 254, 280, 297, 328, 338, 364, 372, 386, 402, 421, 434, 439, 445, 480, 496]
+        self.rtlsdr_valid_gains = [0, 9, 14, 27, 37, 77, 87, 125, 144, 157, 166, 197, 207, 229, 254, 280, 297, 328, 338, 364, 372, 386, 402, 421, 434, 439, 445, 480, 496]
         # Defined by the R820T tuner
-        
+
         self.cal_gain_table=np.array([[100,200,300,400,500,600,700,1700],[6, 10, 13, 14, 18, 22, 28, 28]]) # First column frequeny [MHz], second column gain index [valid_gains]
         self.cal_gain_table[0,:]*=10**6 # Convert to Hz
-        self.M = 7 # Number of receiver channels 
+
+        # USRP (B210) RX gain is continuous 0-76 dB (confirmed via uhd_usrp_probe
+        # on the production LibreSDR B220mini units), not R820T's discrete steps --
+        # model it as a fake "index list" in tenths of dB (0, 0.1, 0.2, .. 76.0 dB)
+        # so the rest of this module's index-based gain bookkeeping is unchanged.
+        self.usrp_valid_gains = list(range(0, 761, 10))
+        self.usrp_cal_gain_db = 30 # Overwritten from [usrp] cal_gain_db -- flat calibration gain, no R820T-style per-frequency table exists for USRP
+        self.valid_gains = self.rtlsdr_valid_gains # Selected in _read_config_file() based on self.backend
+
+        self.M = 7 # Number of receiver channels
         self.N = 2**18 # Number of samples per channel
         self.N_proc = 2**13
         self.iq_mod = None
@@ -82,6 +97,31 @@ class HWC():
 
         self.require_track_lock_intervention = True
         self.rf_center_frequency = 1
+
+        # Tracks delay_sync.py's own sync_state (see its FRAME_TYPE/sync_state
+        # field) across frames so a drop out of STATE_TRACK (6) can be told
+        # apart from the normal one-time climb through the calibration states
+        # at startup -- used to detect "calibration expired" (track lock
+        # lost) and trigger a USRP resync. USRP-only; see start().
+        self.last_sync_state = 0
+        self.last_rf_center_freq = 0
+
+        # Watchdog for calibration that never converges (sync_state stuck
+        # below 5/TRACK_LOCK indefinitely -- e.g. a marginal correlation dynamic
+        # range that occasionally clears the threshold but never for every
+        # channel at once). stuck_cal_start_time is the monotonic() time the
+        # current below-lock streak began (None while locked); once it's been
+        # stuck longer than stuck_cal_timeout_s, a resync is requested the same
+        # way a lost track lock is. last_resync_time enforces resync_cooldown_s
+        # between any two auto-triggered resyncs (this one or the lost-track
+        # one below) so a persistent hardware fault can't retrigger the
+        # stop/reopen recovery back-to-back -- that recovery itself is not free
+        # (a live retune briefly drives every channel into overdrive) and has
+        # been observed to bring the whole box down when repeated too soon.
+        self.stuck_cal_start_time = None
+        self.last_resync_time = None
+        self.stuck_cal_timeout_s = 120
+        self.resync_cooldown_s = 300
 
         # Overwrite default configuration
         self._read_config_file("daq_chain_config.ini")
@@ -128,12 +168,20 @@ class HWC():
             self.logger.error("DAQ core configuration file not found. Default parameters will be used!")
             return -1
         self.N = parser.getint('pre_processing', 'cpi_size')
-        self.M = parser.getint('hw', 'num_ch')                
+        self.M = parser.getint('hw', 'num_ch')
+        self.backend = parser.get('hw', 'backend', fallback='rtlsdr')
+        if self.backend == 'usrp':
+            self.valid_gains = self.usrp_valid_gains
+            self.usrp_cal_gain_db = parser.getfloat('usrp', 'cal_gain_db', fallback=30.0)
+        else:
+            self.valid_gains = self.rtlsdr_valid_gains
         self.N_proc = parser.getint('adpis', 'adpis_proc_size')
         gains_init_str=parser.get('adpis','adpis_gains_init')
         self.cal_track_mode = parser.getint('calibration','cal_track_mode')        
         self.rf_center_frequency = parser.getint('daq','center_freq')
         self.max_sync_fails = parser.getint('calibration','maximum_sync_fails')
+        self.stuck_cal_timeout_s = parser.getfloat('calibration', 'stuck_cal_timeout_s', fallback=60.0)
+        self.resync_cooldown_s = parser.getfloat('calibration', 'resync_cooldown_s', fallback=300.0)
         self.cal_frame_burst_size = parser.getint('calibration','cal_frame_burst_size')
         self.cal_frame_interval = parser.getint('calibration','cal_frame_interval')
         self.gain_lock_interval = parser.getint('calibration','gain_lock_interval')     
@@ -249,6 +297,33 @@ class HWC():
             self.logger.debug(f"Received reply: {reply}")
 
 
+    def _map_ui_gain(self, gain_tenths_db):
+        """
+            Maps a gain value as sent by the (unmodifiable) web UI -- always
+            expressed on the RTL-SDR/R820T's 0-49.6dB discrete scale,
+            regardless of which backend is actually running -- onto an index
+            into self.valid_gains, the table that actually drives the active
+            backend.
+
+            For the rtlsdr backend this is an exact-match lookup, identical
+            to the pre-existing behaviour (self.valid_gains *is*
+            self.rtlsdr_valid_gains). For usrp, whose B210 gain range the UI
+            has no way to select (0-76dB vs. the UI's 0-49.6dB), the request
+            is rescaled proportionally by dB value instead of requiring an
+            exact match, so every UI gain step still lands somewhere sensible
+            across the USRP's real, wider range.
+
+            :raises ValueError: gain_tenths_db isn't one of the UI's valid
+                RTL-SDR gain steps (mirrors the previous exact-match
+                behaviour's error signalling).
+        """
+        ui_index = self.rtlsdr_valid_gains.index(gain_tenths_db) # validates the incoming value; raises ValueError if bogus
+        if self.valid_gains is self.rtlsdr_valid_gains:
+            return ui_index
+        ratio = gain_tenths_db / self.rtlsdr_valid_gains[-1]
+        target = round(ratio * self.usrp_valid_gains[-1] / 10) * 10 # snap to the USRP table's 1dB grid
+        return self.valid_gains.index(target)
+
     def _change_gains(self):
         """
             Sends gain tuning request to the receiver module through the 
@@ -332,10 +407,10 @@ class HWC():
             try:
                 if self.noise_source_state: # The noise source is turned on, we are storing only the gains
                     for m in range(self.M):
-                        self.last_gains[m] = self.valid_gains.index(params[m])
+                        self.last_gains[m] = self._map_ui_gain(params[m])
                 else:
                     for m in range(self.M):
-                        self.gains[m] = self.valid_gains.index(params[m])
+                        self.gains[m] = self._map_ui_gain(params[m])
                     self._change_gains()
                 # Setting gain implies disabling AGC
                 self.agc = False
@@ -369,9 +444,17 @@ class HWC():
             self.last_agc = self.agc
             self.agc = False
 
+            if self.backend == 'usrp':
+                # No per-frequency characterization exists for USRP/B210 -- use a
+                # single configured calibration gain instead of cal_gain_table.
+                cal_gain_ind = min(range(len(self.usrp_valid_gains)),
+                                    key=lambda i: abs(self.usrp_valid_gains[i] - round(self.usrp_cal_gain_db * 10)))
             for m in range(self.M):
                 self.last_gains[m]=self.gains[m]
-                self.gains[m]=self.cal_gain_table[1,np.argmin(abs(self.cal_gain_table[0,:]-self.iq_header.rf_center_freq))]
+                if self.backend == 'usrp':
+                    self.gains[m]=cal_gain_ind
+                else:
+                    self.gains[m]=self.cal_gain_table[1,np.argmin(abs(self.cal_gain_table[0,:]-self.iq_header.rf_center_freq))]
             self._change_gains()
 
             self.logger.info("Enable noise source, [{:d}]".format(self.iq_header.cpi_index))
@@ -400,6 +483,71 @@ class HWC():
 
             self.current_state = "STATE_NOISE_CTR_WAIT"
 
+    def _update_resync_watchdog(self):
+        """
+            Detects two USRP failure modes from self.iq_header's sync_state
+            stream and requests a resync from usrp_daq.cc when either is seen:
+
+            1) Track lock lost (sync_state dropped from 6) without an
+               explicit frequency change -- "calibration expired".
+            2) Calibration that never converges to track lock at all within
+               stuck_cal_timeout_s (e.g. a marginal correlation dynamic range
+               that occasionally clears the per-channel threshold but never
+               for every channel in the same pass).
+
+            A live retune in usrp_daq.cc can overflow a USRP's buffer and
+            permanently desync channels; a full stop/close/reopen recovers it
+            (see usrp_daq.cc's ZMQ 'y' handler). This uses the dedicated 'y'
+            command, not a same-frequency 'c' -- that was tried first and
+            confirmed live to misfire (the web UI sends its configured
+            frequency as an ordinary 'c' on every connect, including right
+            after a fresh boot, which routinely matches the current frequency
+            too). An explicit frequency change already triggers its own
+            recovery (the 'c' handler's timed-retune path), so case 1 only
+            fires when the drop out of track happened WITHOUT one (center
+            frequency unchanged since the last frame), to avoid doing both
+            back-to-back.
+
+            Both cases share resync_cooldown_s so a persistent fault can't
+            retrigger the recovery (itself not free -- it briefly drives
+            every channel into overdrive, and has been observed to crash the
+            box when repeated too soon) more often than that.
+
+            USRP-only; a no-op for other backends.
+        """
+        if self.backend != 'usrp':
+            return
+
+        now = monotonic()
+
+        lost_track = (self.last_sync_state == 6 and self.iq_header.sync_state != 6
+                      and self.iq_header.rf_center_freq == self.last_rf_center_freq)
+
+        if self.iq_header.sync_state >= 5 or self.iq_header.rf_center_freq != self.last_rf_center_freq:
+            self.stuck_cal_start_time = None
+        elif self.stuck_cal_start_time is None:
+            self.stuck_cal_start_time = now
+        stuck = (self.stuck_cal_start_time is not None
+                 and (now - self.stuck_cal_start_time) > self.stuck_cal_timeout_s)
+
+        if lost_track or stuck:
+            if self.last_resync_time is None or (now - self.last_resync_time) > self.resync_cooldown_s:
+                reason = "Track lock lost" if lost_track else \
+                    "Calibration stuck -- no track lock within {:.0f}s".format(self.stuck_cal_timeout_s)
+                self.logger.warning("{:s} -- requesting USRP resync at {:d} Hz".format(
+                    reason, self.iq_header.rf_center_freq))
+                msg_byte_array = inter_module_messages.pack_msg_resync(self.module_identifier)
+                self.rtl_daq_socket.send(msg_byte_array)
+                reply = self.rtl_daq_socket.recv()
+                self.logger.debug(f"Received reply: {reply}")
+                self.last_resync_time = now
+                self.stuck_cal_start_time = None
+            else:
+                self.logger.debug("Resync needed but suppressed by cooldown ({:.0f}s remaining)".format(
+                    self.resync_cooldown_s - (now - self.last_resync_time)))
+
+        self.last_sync_state = self.iq_header.sync_state
+        self.last_rf_center_freq = self.iq_header.rf_center_freq
 
     def start(self):
         """
@@ -450,10 +598,15 @@ class HWC():
                     if(self.iq_header.adc_overdrive_flags & 1<<m):
                         self.logger.warning("Overdrive ch {:d} [{:d}]".format(m, self.iq_header.cpi_index))
 
+                # -> Detect calibration expiration (track lock lost) or
+                #    calibration that never converges at all, and resync if so.
+                #    See _update_resync_watchdog()'s docstring for the details.
+                self._update_resync_watchdog()
+
                 #
                 #------------------------------------------>
-                #            
-                if self.current_state == "STATE_INIT": 
+                #
+                if self.current_state == "STATE_INIT":
                     # Set initial gain values
                     self._change_gains()
 
@@ -701,4 +854,4 @@ if __name__ == "__main__":
     if HWC_inst0.init() == 0:
         HWC_inst0.start()
 
-HWC_inst0.close()
+    HWC_inst0.close()

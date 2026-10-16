@@ -1,5 +1,40 @@
 from struct import pack
 
+def pack_msg_resync(module_identifier):
+    """
+        Prepares the byte array of an inter-module ZMQ message requesting a
+        USRP resync (device close/reopen + PPS re-sync) at the current
+        frequency, with no retune. USRP-only ('y' handler in usrp_daq.cc).
+
+        Deliberately a distinct command from pack_msg_rf_tune(), not just
+        pack_msg_rf_tune() called with the unchanged frequency: usrp_daq.cc
+        used to infer "resync" from a same-frequency 'c', but the
+        krakensdr_doa web UI also sends its configured frequency as an
+        ordinary 'c' on every connect (including right after a fresh boot),
+        which routinely matches the current frequency too -- that made the
+        inference misfire into an unnecessary, and once observed to hang,
+        device reopen moments after a perfectly good boot. A same-frequency
+        'c' is now a no-op on the receiving end; only this command forces
+        the resync.
+
+        Parameters:
+        -----------
+            :param: module_identifier: Source module id
+
+            :type: module_identifier: int
+
+        Return:
+        -------
+            Assembled message structure in byte array
+    """
+    msg_length = 128  # Total message length 128 byte
+    msg_byte_array  = pack("b", module_identifier)  # 1 byte
+    msg_byte_array += 'y'.encode('ascii')  # 1 byte
+    for m in range(msg_length - 1 - 1):
+        msg_byte_array += pack('b', 0)
+
+    return msg_byte_array
+
 def pack_msg_reconfiguration(module_identifier,center_frequency, sample_rate, gain):
     """
         Prepares the byte array of an inter-module ZMQ message for tunner reconfiguration.
@@ -23,10 +58,12 @@ def pack_msg_reconfiguration(module_identifier,center_frequency, sample_rate, ga
     msg_length = 128 # Total message length 128 byte
     msg_byte_array  = pack("b", module_identifier) # 1byte
     msg_byte_array += 'r'.encode('ascii') # 1 byte
-    msg_byte_array += pack('III', center_frequency, sample_rate, gain) # 12 byte
-    for m in range(msg_length-1-1-12):    
+    # center_frequency is 8 byte ('Q') -- 4 byte ('I') tops out at ~4.295GHz,
+    # well within common bands (e.g. 5.8GHz ISM); see pack_msg_rf_tune.
+    msg_byte_array += pack('QII', center_frequency, sample_rate, gain) # 16 byte
+    for m in range(msg_length-1-1-16):
         msg_byte_array +=pack('b',0)
-    
+
     return msg_byte_array
 
 def pack_msg_rf_tune(module_identifier,center_frequency):
@@ -49,10 +86,14 @@ def pack_msg_rf_tune(module_identifier,center_frequency):
     msg_length = 128 # Total message length 128 byte
     msg_byte_array  = pack("b", module_identifier) # 1byte
     msg_byte_array += 'c'.encode('ascii') # 1 byte
-    msg_byte_array += pack('I', center_frequency) # 4 byte
-    for m in range(msg_length-1-1-4):    
+    # 8 byte ('Q'), not 4 ('I') -- 'I' tops out at ~4.295GHz, which is below
+    # common bands like the 5.8GHz ISM band (confirmed live: struct.error
+    # crashed hw_controller.py's control loop the instant it tried to relay
+    # a 5.8GHz request here).
+    msg_byte_array += pack('Q', center_frequency) # 8 byte
+    for m in range(msg_length-1-1-8):
         msg_byte_array +=pack('b',0)
-    
+
     return msg_byte_array
 
 def pack_msg_set_gain(module_identifier, gains):
@@ -128,6 +169,44 @@ def pack_msg_noise_source_ctr(module_identifier, state):
         msg_byte_array += pack('b',0) # 1 byte
     for m in range(msg_length-1-1-1):    
         msg_byte_array +=pack('b',0)    
+    return msg_byte_array
+
+def pack_msg_sample_skip(module_identifier, delays):
+    """
+        Prepares the byte array of an inter-module ZMQ message carrying the
+        raw per-channel integer sample delay measured by STATE_SAMPLE_CAL's
+        cross-correlation against the reference channel, for a one-shot bulk
+        alignment skip on the receiving end (usrp_daq.cc's 'k' handler).
+
+        Deliberately a separate message from pack_msg_sample_freq_tune()'s
+        ppm encoding: that encoding is lossy once clamped to MAX_FS_PPM_OFFSET
+        and was never designed to carry delays past a few dozen samples (see
+        usrp_daq.cc's old 's'-handler comment) -- USRP's PPS-slaved devices
+        can show a one-time startup misalignment of hundreds to tens of
+        thousands of samples, which needs the exact measured value applied
+        once, not walked off 1 sample at a time.
+
+        Parameters:
+        -----------
+            :param: module_identifier: Source module id
+            :param: delays: List of per-channel integer sample delays
+                             (self.delays from delaySynchronizer), signed.
+
+            :type: module_identifier: int
+            :type: delays: list of int values [delay for ch1, delay for ch2, ..]
+
+        Return:
+        -------
+            Assembled message structure in byte array
+    """
+    msg_length = 128  # Total message length 128 byte
+    msg_byte_array  = pack("b", module_identifier)  # 1 byte
+    msg_byte_array += 'k'.encode('ascii')  # 1 byte
+    for delay in delays:
+        msg_byte_array += pack('i', delay)  # 4 byte
+    for m in range(msg_length - 1 - 1 - len(delays) * 4):
+        msg_byte_array += pack('b', 0)
+
     return msg_byte_array
 
 def pack_msg_sample_freq_tune(module_identifier, fs_ppm_offsets):

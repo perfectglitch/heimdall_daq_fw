@@ -4,6 +4,7 @@ echo "Shut down DAQ chain .."
 #sudo killall -s 9 rtl*
 
 sudo pkill -64 rtl_daq.out
+sudo pkill -64 usrp_daq.out
 sudo kill -64 $(ps ax | grep "[p]ython3 _testing/test_data_synthesizer.py" | awk '{print $1}') 2> /dev/null
 sudo pkill -64 sync.out
 sudo pkill -64 decimate.out

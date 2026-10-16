@@ -34,7 +34,7 @@
 #include "ini.h"
 #include "iq_header.h"
 #include "sh_mem_util.h"
-#include "rtl_daq.h"
+#include "im_msg.h"
 
 #ifdef ARM_NEON
 #include "NE10.h"
@@ -60,6 +60,7 @@ typedef struct
     int en_filter_reset;
     int tap_size;
     int log_level;
+    int sample_bit_depth; // Bits per I or Q component from the acquisition stage (8: RTL-SDR, 16: USRP)
 } configuration;
 
 /*
@@ -82,8 +83,10 @@ static int handler(void* conf_struct, const char* section, const char* name,
     {pconfig->en_filter_reset = atoi(value);}
     else if(MATCH("pre_processing", "fir_tap_size"))
     {pconfig->tap_size = atoi(value);}
-    else if (MATCH("daq", "log_level")) 
+    else if (MATCH("daq", "log_level"))
     {pconfig->log_level = atoi(value);}
+    else if (MATCH("daq", "sample_bit_depth"))
+    {pconfig->sample_bit_depth = atoi(value);}
     else {return 0;  /* unknown section/name, error */}
     return 0;
 }
@@ -115,12 +118,15 @@ int main(int argc, char **argv)
     ch_no = config.num_ch;
     dec = config.decimation_ratio;
     filter_reset = (bool) config.en_filter_reset;
-    log_set_level(config.log_level); 
+    if (config.sample_bit_depth == 0) {config.sample_bit_depth = 8;} // Default for configs predating this field (RTL-SDR)
+    int byte_width = config.sample_bit_depth / 8; // Bytes per I or Q component in the raw input stream
+    log_set_level(config.log_level);
     log_info("Config succesfully loaded from %s",INI_FNAME);
     log_info("Channel number: %d", ch_no);
     log_info("Decimation ratio: %d",dec);
     log_info("CPI size: %d", config.cpi_size);
     log_info("Calibration sample size : %d", config.cal_size);
+    log_info("Input sample bit depth: %d (byte width per component: %d)", config.sample_bit_depth, byte_width);
     
                 
     /*
@@ -271,10 +277,22 @@ int main(int argc, char **argv)
                                 int dec_index = 0; 
                             #endif
                             //De-interleaving input data
-                            for(int sample_index=0; sample_index<iq_header->cpi_length*dec; sample_index++)
+                            if (byte_width == 1) // uint8 (RTL-SDR)
                             {
-                                fir_input_buffer_i[sample_index] = (input_data_buffer[2*sample_index]-DC)/DC;   // I
-                                fir_input_buffer_q[sample_index] = (input_data_buffer[2*sample_index+1]-DC)/DC; // Q
+                                for(int sample_index=0; sample_index<iq_header->cpi_length*dec; sample_index++)
+                                {
+                                    fir_input_buffer_i[sample_index] = (input_data_buffer[2*sample_index]-DC)/DC;   // I
+                                    fir_input_buffer_q[sample_index] = (input_data_buffer[2*sample_index+1]-DC)/DC; // Q
+                                }
+                            }
+                            else // byte_width == 2, signed int16 (USRP sc16) -- already zero-centered, no DC offset
+                            {
+                                int16_t* input_data_buffer_16 = (int16_t*) input_data_buffer;
+                                for(int sample_index=0; sample_index<iq_header->cpi_length*dec; sample_index++)
+                                {
+                                    fir_input_buffer_i[sample_index] = input_data_buffer_16[2*sample_index]   / 32768.0f; // I
+                                    fir_input_buffer_q[sample_index] = input_data_buffer_16[2*sample_index+1] / 32768.0f; // Q
+                                }
                             }
                             // Perform filtering
                             #ifdef ARM_NEON
@@ -308,7 +326,7 @@ int main(int argc, char **argv)
                                     }
                                 }                            
                             #endif
-                            input_data_buffer  += 2*iq_header->cpi_length*dec;
+                            input_data_buffer  += 2*iq_header->cpi_length*dec*byte_width;
                             output_data_buffer += 2*iq_header->cpi_length;
                         }                                     
                     }
@@ -318,13 +336,24 @@ int main(int argc, char **argv)
                     iq_header->sampling_freq = iq_header->adc_sampling_freq;
                     iq_header->cpi_length = (uint32_t) iq_header->cpi_length;
 
-                    /* Convert cint8 to cfloat32 without filtering and decimation on cal type frames*/
-                    for(int sample_index=0; sample_index<iq_header->cpi_length*iq_header->active_ant_chs; sample_index++)
+                    /* Convert raw input samples to cfloat32 without filtering and decimation on cal type frames*/
+                    if (byte_width == 1) // uint8 (RTL-SDR)
+                    {
+                        for(int sample_index=0; sample_index<iq_header->cpi_length*iq_header->active_ant_chs; sample_index++)
                         {
                             output_data_buffer[2*sample_index]   = (float)(input_data_buffer[2*sample_index]-DC)/DC;   // I
                             output_data_buffer[2*sample_index+1] = (float)(input_data_buffer[2*sample_index+1]-DC)/DC; // Q
-
                         }
+                    }
+                    else // byte_width == 2, signed int16 (USRP sc16) -- already zero-centered, no DC offset
+                    {
+                        int16_t* input_data_buffer_16 = (int16_t*) input_data_buffer;
+                        for(int sample_index=0; sample_index<iq_header->cpi_length*iq_header->active_ant_chs; sample_index++)
+                        {
+                            output_data_buffer[2*sample_index]   = input_data_buffer_16[2*sample_index]   / 32768.0f; // I
+                            output_data_buffer[2*sample_index+1] = input_data_buffer_16[2*sample_index+1] / 32768.0f; // Q
+                        }
+                    }
 
                 }
                 log_trace("<--Transfering frame type: %d, daq ind:[%d]",iq_header->frame_type, iq_header->daq_block_index);

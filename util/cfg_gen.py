@@ -77,6 +77,9 @@ calibration = {
     "amplitude_tolerance"             :"1",
     "phase_tolerance"                 :"2",
     "maximum_sync_fails"              :"5",
+    "frac_cal_timeout_s"              :"10",
+    "stuck_cal_timeout_s"             :"60",
+    "resync_cooldown_s"               :"300",
 }
 #[adpis]
 adpis = {

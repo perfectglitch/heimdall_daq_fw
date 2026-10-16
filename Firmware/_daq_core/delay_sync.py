@@ -28,7 +28,7 @@ import logging
 from ntpath import join
 import sys
 from struct import pack
-from time import sleep
+from time import sleep, monotonic
 from os.path import join
 
 # Import third-party modules
@@ -38,7 +38,8 @@ from scipy import fft
 from scipy.optimize import curve_fit
 from configparser import ConfigParser
 import zmq
-import skrf as rf
+# skrf is only needed for iq_adjust_source="touchstone" (see below) -- imported
+# lazily there so the "explicit-time-delay" path doesn't require it installed.
 
 import numba as nb
 from numba import jit, njit
@@ -56,7 +57,13 @@ class delaySynchronizer():
     
     def __init__(self):
         
-        logging.basicConfig(level=10)
+        # Root logger stays at WARNING -- this module's own verbosity is set
+        # further down via self.logger.setLevel(self.log_level) from the ini.
+        # Setting the root logger to DEBUG here would also make third-party
+        # loggers (e.g. numba's JIT compiler tracing) spew massive verbose
+        # output on every @njit compilation, which can turn a few seconds of
+        # first-run JIT compilation into many minutes.
+        logging.basicConfig(level=logging.WARNING)
         self.logger = logging.getLogger(__name__)
 
         self.module_identifier = 5 # Inter-module message module identifier        
@@ -86,21 +93,61 @@ class delaySynchronizer():
         self.iq_adjust_time = None
         self.iq_adjust_table  = None # Frequency - Phase table for all channels 
 
+        # [dB] -- Updated from .ini. Default (20) was tuned against a noise
+        # source TX bandwidth comfortably wider than the RX capture window;
+        # at higher RX sample rates the TX bandwidth has to widen to match
+        # (see daq_chain_config.ini's [noise_source] tx_sample_rate), which
+        # spreads the same total noise power thinner and/or runs closer to
+        # the HackRF's own spectral-flatness limits -- confirmed live at
+        # 16 Msps: dynamic range hovered consistently in the 13-19dB range
+        # (never reliably above 20) despite maxed TX gain/amp, with no
+        # other symptom of a genuine fault (zero recv()/overflow errors).
+        # Configurable per-deployment instead of hardcoded so this tradeoff
+        # (calibration strictness vs. usable bandwidth) is a conscious
+        # choice, not a silent ceiling nobody could see or adjust.
         self.min_corr_peak_dyn_range = 20 # [dB]
         self.corr_peak_offset = 100 # [sample]
         self.cal_track_mode = 0        
         self.amplitude_cal_mode = "channel_power" # "default" / "disabled" / "channel_power"  -> Updated from .ini
 
-        self.phase_diff_tolerance = 3 # deg, maximum allowable phase difference
+        self.phase_diff_tolerance = 1 # deg, maximum allowable phase difference
         self.amp_diff_tolerance = 0.5 # power ratio  maximum allowable amplitude difference, not dB!
-        self.frac_delay_tolerance = 0.03
+        # 0.03 assumed RTL-SDR-style independent free-running channels. USRP
+        # channel/device pairs have a small, fixed (not drifting) skew
+        # inherent to the AD9361 RFIC's digital front-end and PPS-lock
+        # characteristics (confirmed ~0.12-0.4 samples across channels on
+        # the production hardware) -- a real phase characteristic for
+        # STATE_IQ_CAL to absorb, not a timing error usrp_daq.cc's
+        # integer-sample skip correction can zero out (it only acts on
+        # STATE_SAMPLE_CAL's >=1-sample corrections, deliberately not this
+        # stage's sub-sample ones -- a 1-sample skip would overshoot a <1
+        # sample target every time). 0.03 would block convergence permanently.
+        # 0.45 itself proved too tight on a later power-cycle: the
+        # per-power-cycle-random AD9361 phase state landed at 0.456/0.458 on
+        # two channels, just outside the observed 0.12-0.4 range, and since
+        # usrp_daq.cc has no mechanism to correct sub-sample delay at all
+        # (see its 's' handler), there was nothing to shrink that residual --
+        # it deadlocked in STATE_FRAC_SAMPLE_CAL/STATE_FRAC_SYNC_WAIT forever.
+        # Widened the margin a bit further.
+        self.frac_delay_tolerance = 0.5
+        # Wall-clock deadline for a single STATE_FRAC_SAMPLE_CAL attempt (started
+        # when STATE_SAMPLE_CAL first hands off to it, and NOT reset across the
+        # STATE_FRAC_SAMPLE_CAL/STATE_FRAC_SYNC_WAIT retry loop, so it bounds the
+        # whole attempt, not each retry). The residual sub-sample skew above is a
+        # fixed-but-random-per-power-cycle AD9361 characteristic, not a drift --
+        # so if it hasn't converged below frac_delay_tolerance within this many
+        # seconds, keeping the ppm-tuning loop running longer won't help either.
+        # On timeout the calibrator just accepts whatever residual is left and
+        # proceeds to STATE_IQ_CAL, the same as a normal convergence -- this is
+        # a deliberate give-up, not a sync failure, so it does NOT feed into
+        # sync_failed_cntr/max_sync_fails or force a STATE_INIT restart.
+        self.frac_cal_start_time = None
+        self.frac_cal_timeout_s = 10 # sec -> Updated from .ini
         self.sync_failed_cntr = 0 # Counts the number of iq or sample sync fails in track mode
         self.max_sync_fails = 3 # Maximum number of synchronization fails before the sync track is lost
         self.sync_failed_cntr_total = 0
 
         self.MIN_FS_PPM_OFFSET = 0.0000001
-        self.MAX_FS_PPM_OFFSET = 0.01
-        self.INT_FS_TUNE_GAIN  = np.array([[100, 2, 0],[50, 25, 15]]) #Reference table for tuning - [Delay limits] [Tune gains]
         self.FRAC_FS_TUNE_GAIN = 20
         
         # Auxiliary state variables
@@ -165,9 +212,12 @@ class delaySynchronizer():
         self.M = parser.getint('hw', 'num_ch')
         self.R = parser.getint('pre_processing', 'decimation_ratio')
         self.N_proc = parser.getint('calibration', 'corr_size')
+        self.min_corr_peak_dyn_range = parser.getfloat('calibration', 'min_corr_peak_dyn_range',
+                                                         fallback=self.min_corr_peak_dyn_range)
         self.std_ch_ind = parser.getint('calibration','std_ch_ind')
         self.amp_diff_tolerance = parser.getint('calibration', 'amplitude_tolerance')
         self.phase_diff_tolerance = parser.getint('calibration', 'phase_tolerance')
+        self.frac_cal_timeout_s = parser.getfloat('calibration', 'frac_cal_timeout_s')
         self.cal_track_mode = parser.getint('calibration','cal_track_mode')
         self.max_sync_fails = parser.getint('calibration','maximum_sync_fails')
         self.amplitude_cal_mode = parser.get('calibration','amplitude_cal_mode')
@@ -202,6 +252,7 @@ class delaySynchronizer():
             self.iq_adjust = self.iq_adjust_amplitude * np.exp(1j*iq_adjust_phase) # Assemble IQ adjustment vector
             self.iq_adjust = np.insert(self.iq_adjust, self.std_ch_ind, 1+0j)
         elif self.iq_adjust_source == "touchstone":
+            import skrf as rf
             for m in range(self.M):
                 fname = join("_calibration", f"cable_ch{m}.s1p")
                 self.logger.info(f"Loading: {fname}")
@@ -253,6 +304,16 @@ class delaySynchronizer():
         self.out_shmem_iface_iq = outShmemIface("delay_sync_iq",
                                  out_shmem_size,
                                  drop_mode = True)
+        # DEBUG (temporary): this interface's own drop-frame warning is
+        # silenced by outShmemIface's hardcoded default (ignore_frame_drop_warning
+        # = True in its __init__). Chasing a krakensdr_doa UI freeze where its
+        # consumer thread ends up permanently parked in wait_buff_free() with no
+        # exception anywhere in its own per-frame body -- i.e. this producer
+        # stops offering it a free buffer. Enabling the existing counter/warning
+        # here will show directly whether wait_buff_free() starts permanently
+        # returning "no buffer free" (drop) right when the freeze happens, or
+        # whether it's some other, subtler desync.
+        self.out_shmem_iface_iq.ignore_frame_drop_warning = False
         if not self.out_shmem_iface_iq.init_ok:
             self.logger.critical("Shared memory (IQ server) initialization failed, exiting..")
             return -1
@@ -283,6 +344,78 @@ class delaySynchronizer():
             self.out_shmem_iface_hwc.destory_sm_buffer()  
             
         self.logger.info("Interfaces are closed")
+
+    def _zero_dc_bins(self, spectrum, sampling_freq, notch_hz=20000.0):
+        """
+            Zeros FFT bins within notch_hz of DC, in place (both the
+            near-zero bins and their wraparound negative-frequency
+            counterparts near the end of the array).
+
+            Confirmed live (raw IQ capture during a calibration dynamic-
+            range failure) that a strong near-DC artifact -- 10-60+ dB
+            above the surrounding noise floor, present in every channel,
+            sitting a few kHz off exact DC -- dominates the spectrum and
+            contaminates the cross-correlation STATE_SAMPLE_CAL uses for
+            sample-delay calibration: being shared by every channel, it
+            contributes a near-constant (very slowly lag-varying) term to
+            the correlation, which shows up as spurious secondary peaks
+            competing with the true, narrow calibration-noise peak -- worse
+            at higher sample rates, where the real calibration noise floor
+            is thinner relative to this artifact's fixed absolute power.
+            A plain per-block mean subtraction (already applied elsewhere,
+            e.g. correct_iq()) only removes an exact 0 Hz bias and leaves
+            this few-kHz-wide spike untouched, which is why that wasn't
+            already handling it.
+        """
+        n = len(spectrum)
+        bin_hz = sampling_freq / n
+        n_bins = max(1, int(np.ceil(notch_hz / bin_hz)))
+        spectrum[0:n_bins + 1] = 0  # DC and n_bins positive-frequency neighbors
+        spectrum[n - n_bins:n] = 0  # n_bins negative-frequency neighbors
+        return spectrum
+
+    def _passband_mask(self, psd_db, psd_freqs, sampling_freq, target_n, threshold_db=10.0):
+        """
+            Builds a boolean mask (length target_n, standard FFT bin order)
+            that zeros out frequency bins where the calibration noise
+            source's own transmitted spectrum is significantly weaker than
+            its flat region.
+
+            Confirmed live (averaged FFT across several calibration-failure
+            captures, all channels) that the HackRF's actual usable
+            bandwidth at a wide TX sample rate setting is narrower than
+            requested, with a sharp notch and asymmetric rolloff eating a
+            large fraction of the nominally flat capture window. Those bins
+            carry thermal noise with no real calibration signal -- including
+            them in the correlation only weakens its dynamic range, the same
+            way a matched filter's bandwidth is restricted to where the
+            actual signal is, not the full raw capture.
+
+            psd_db/psd_freqs describe a reference measurement (the
+            std_ch_ind channel's own unpadded PSD, already computed for the
+            spectral-centroid diagnostic right above this call) on an
+            N_proc-length grid; this interpolates that decision onto the
+            target grid (2*N_proc, zero-padded for the correlation) by
+            frequency, not by index, since the two grids have different bin
+            spacing.
+
+            Threshold is relative to the PSD's own median, not an absolute
+            level: the flat region is normally the majority of the band, so
+            its level tracks the median regardless of absolute signal power
+            (TX gain, path loss, etc.) -- a fixed dB threshold would need
+            re-tuning for every gain/config change, this doesn't.
+        """
+        baseline_db = np.median(psd_db)
+        good = psd_db >= (baseline_db - threshold_db)
+
+        order = np.argsort(psd_freqs)
+        sorted_freqs = psd_freqs[order]
+        sorted_good = good[order].astype(np.float64)
+
+        target_freqs = np.fft.fftfreq(target_n, d=1.0 / sampling_freq)
+        interp_good = np.interp(target_freqs, sorted_freqs, sorted_good)
+        return interp_good >= 0.5
+
     def calc_iq_sync(self, iq_samples):
         """
             This function calculates the synchronization status of the signal processing channels.
@@ -528,16 +661,67 @@ class delaySynchronizer():
                     sync_state        = 2
                     sample_sync_flag  = True
                     delay_update_flag = 0
-                    fs_ppm_offsets=[0]*self.M 
 
-                    # ->  Calculate correlation functions            
+                    # ->  Calculate correlation functions
                     np_zeros = np.zeros(self.N_proc, dtype=np.complex64)
                     x_padd = np.concatenate([iq_samples[self.std_ch_ind, 0:self.N_proc], np_zeros])
                     x_fft = fft.fft(x_padd, workers=4, overwrite_x=True)
-                    
+                    self._zero_dc_bins(x_fft, self.iq_header.sampling_freq)
+
+                    # passband_mask stays None (no-op) outside calibration
+                    # frames -- it's only meaningful measured against a
+                    # genuine noise burst, same gating as the diagnostic
+                    # below it reuses.
+                    passband_mask = None
+                    if self.iq_header.frame_type == IQHeader.FRAME_TYPE_CAL:
+                        # A fresh, unpadded FFT of just the reference channel's
+                        # own samples -- deliberately not reusing x_fft above,
+                        # which is zero-padded to 2*N_proc for the correlation
+                        # and would need its bins/fftfreq sized to match that
+                        # padding instead of N_proc.
+                        x_psd_fft = fft.fft(iq_samples[self.std_ch_ind, 0:self.N_proc], workers=4)
+                        psd = np.abs(x_psd_fft)**2
+                        freq_bins = np.fft.fftfreq(self.N_proc, d=1.0/self.iq_header.sampling_freq)
+                        psd_total = np.sum(psd)
+                        if psd_total > 0:
+                            centroid_hz = np.sum(freq_bins * psd) / psd_total
+                            half_bw = self.iq_header.sampling_freq / 2
+                            self.logger.info(
+                                "Calibration signal spectral centroid: {:+.0f} Hz from RX center "
+                                "(RX center {:.0f} Hz, capture half-bandwidth {:.0f} Hz -- a centroid "
+                                "near +/-{:.0f} Hz suggests the noise source is clipped at that edge "
+                                "of the capture window, not just off-center within it)".format(
+                                    centroid_hz, self.iq_header.rf_center_freq, half_bw, half_bw))
+
+                        # DISABLED: an attempt to restrict the correlation to
+                        # the noise source's own flat passband (motivated by
+                        # a real, confirmed notch/rolloff at wide TX sample
+                        # rates), but confirmed live to do active harm at a
+                        # previously-solid rate (8 Msps) where no such defect
+                        # exists: a single FFT snapshot of genuinely flat
+                        # white noise has very high bin-to-bin variance (a
+                        # single periodogram sample can easily land 10+dB
+                        # below the true mean purely from measurement noise,
+                        # not because that bin is actually bad), so a fixed
+                        # 10dB-below-median threshold against one noisy
+                        # snapshot randomly excluded ~20% of genuinely good
+                        # bins every attempt (confirmed: 104864/131072 kept
+                        # at 8 Msps, where it should have been ~all of them).
+                        # That's a different random subset each attempt,
+                        # which adds instability rather than removing a real
+                        # defect. Needs averaging multiple snapshots (Welch's
+                        # method) before a threshold like this would be
+                        # trustworthy -- not attempted here. _zero_dc_bins()
+                        # above is unaffected (small, fixed region, not a
+                        # per-attempt statistical decision) and stays active.
+                        pass
+
                     for m in self.channel_list:
                         y_padd = np.concatenate([np_zeros, iq_samples[m, 0:self.N_proc]])
                         y_fft = fft.fft(y_padd, workers=4, overwrite_x=True)
+                        self._zero_dc_bins(y_fft, self.iq_header.sampling_freq)
+                        if passband_mask is not None:
+                            y_fft *= passband_mask
                         self.corr_functions[m,:] = np.abs(fft.ifft(x_fft.conj() * y_fft, workers=4, overwrite_x=True))**2
                     # ->  Calculate sample delays, check dynamic range
                     # WARNING: This dynamic range checking assumes dirac like coorelation peak                    
@@ -546,30 +730,72 @@ class delaySynchronizer():
 
                         # Check dynamic range
                         # TODO: Check overindexing
-                        dyn_range = 10*np.log10(self.corr_functions[m, peak_index] / 
+                        dyn_range = 10*np.log10(self.corr_functions[m, peak_index] /
                                                  self.corr_functions[m, peak_index+self.corr_peak_offset])
                         if dyn_range < self.min_corr_peak_dyn_range:
                             self.logger.warning("Correlation peak dynamic range is insufficient to perform calibration")
                             self.logger.warning("Real value: {:.2f}, minimum: {:.2f}".format(dyn_range, self.min_corr_peak_dyn_range))
+                            # TEMP DIAGNOSTIC: dump the raw correlation shape
+                            # around the peak -- the dyn_range metric above
+                            # only compares the peak to one fixed-offset
+                            # point (corr_peak_offset=100 samples away), not
+                            # a genuine noise floor, and assumes a Dirac-like
+                            # peak (see this function's own WARNING comment
+                            # a few lines up). A secondary lobe landing near
+                            # that one comparison point -- plausible from the
+                            # noise source's PRNG at wider bandwidths -- would
+                            # report "insufficient" even with a real, sharp,
+                            # strong peak. Capped to the first 5 dumps so this
+                            # doesn't spam disk during an extended failure.
+                            if not hasattr(self, '_dyn_range_dump_cntr'):
+                                self._dyn_range_dump_cntr = 0
+                            if self._dyn_range_dump_cntr < 5:
+                                lo = max(0, peak_index - 500)
+                                hi = min(len(self.corr_functions[m, :]), peak_index + 500)
+                                dump_path = join("_logs", f"corr_shape_ch{m}_{self._dyn_range_dump_cntr}.npz")
+                                try:
+                                    # Also save the raw calibration-burst IQ
+                                    # itself (all channels, this CPI) so the
+                                    # actual PSD can be checked directly --
+                                    # e.g. against the known DC/LO-leakage
+                                    # spike frequency (lo_offset_frac *
+                                    # sampling_freq from RX center; see
+                                    # usrp_daq.cc's Auto Max VFO exclusion
+                                    # zone comment for that artifact).
+                                    np.savez_compressed(dump_path,
+                                                         corr_window=self.corr_functions[m, lo:hi],
+                                                         peak_index=peak_index, lo=lo, hi=hi,
+                                                         corr_peak_offset=self.corr_peak_offset,
+                                                         dyn_range=dyn_range, channel=m,
+                                                         iq_samples=iq_samples[:, 0:self.N_proc],
+                                                         std_ch_ind=self.std_ch_ind,
+                                                         sampling_freq=self.iq_header.sampling_freq,
+                                                         rf_center_freq=self.iq_header.rf_center_freq)
+                                    self.logger.warning(f"Dumped correlation shape + raw IQ to {dump_path}")
+                                except Exception as e:
+                                    self.logger.warning(f"Failed to dump correlation shape: {e}")
+                                self._dyn_range_dump_cntr += 1
                             delay_update_flag = 0
                             sample_sync_flag = False # Sync can not be checked properly
                             break
                         
                         # Calculate sample offset
-                        self.delays[m] = (self.N_proc - peak_index)                              
-                        fs_tune_gain_m = (self.INT_FS_TUNE_GAIN[1,(self.INT_FS_TUNE_GAIN[0,:] <= abs(self.delays[m]))])[0]      
-                        fs_ppm_offsets[m] = -1*self.delays[m] * fs_tune_gain_m * self.MIN_FS_PPM_OFFSET                        
-                        if abs(fs_ppm_offsets[m]) > self.MAX_FS_PPM_OFFSET:
-                            fs_ppm_offsets[m] = np.sign(fs_ppm_offsets[m])*self.MAX_FS_PPM_OFFSET                        
+                        self.delays[m] = (self.N_proc - peak_index)
 
                         if np.abs(self.delays[m]) >= 1:
                             sample_sync_flag = False # Misalling detected
                             delay_update_flag=1
-                        self.logger.debug("Channel {:d}, delay: {:d}, tune gain: {:d} ppm-offset: {:.7f}, ".format(m, self.delays[m], fs_tune_gain_m, fs_ppm_offsets[m]))
+                        self.logger.debug("Channel {:d}, delay: {:d}".format(m, self.delays[m]))
 
-                    # Set time delay 
+                    # Set time delay -- sent as the raw measured sample count
+                    # (see pack_msg_sample_skip) for a one-shot bulk skip on
+                    # the receiving end, not walked off 1 sample/cycle: a
+                    # USRP's PPS-slaved devices can show a one-time startup
+                    # misalignment of thousands of samples, and this
+                    # correlation measurement (post dynamic-range check above)
+                    # is already trustworthy at that magnitude.
                     if delay_update_flag:
-                        msg_byte_array = inter_module_messages.pack_msg_sample_freq_tune(self.module_identifier, fs_ppm_offsets)
+                        msg_byte_array = inter_module_messages.pack_msg_sample_skip(self.module_identifier, self.delays.tolist())
                         self.rtl_daq_socket.send(msg_byte_array)
                         reply = self.rtl_daq_socket.recv()
                         self.logger.debug(f"Received reply: {reply}")
@@ -577,8 +803,9 @@ class delaySynchronizer():
                         self.current_state = "STATE_SYNC_WAIT"
                         
                     if sample_sync_flag:
-                        self.sample_compensation_cntr+=1 # Used to track how many succesfull compenssation have been performed so far 
-                        self.current_state = "STATE_FRAC_SAMPLE_CAL"  
+                        self.sample_compensation_cntr+=1 # Used to track how many succesfull compenssation have been performed so far
+                        self.current_state = "STATE_FRAC_SAMPLE_CAL"
+                        self.frac_cal_start_time = monotonic() # Start the give-up timer for this attempt
                 #
                 #------------------------------------------>
                 #
@@ -597,26 +824,39 @@ class delaySynchronizer():
                     # Calculate fractional delays
                     taus = self.estimate_frac_delays(iq_samples[0:self.N_proc])
                     self.logger.debug(f"Fractional delays: {taus}")
-                    
-                    # Determine and set tune values
-                    frac_delay_update_flag = False
-                    fs_ppm_offsets=[0]*self.M 
-                    
-                    for m in range(self.M-1):
-                        if abs(taus[m]) > self.frac_delay_tolerance:
-                            fs_ppm_offsets[m+1] = np.sign(taus[m]) * np.abs(taus[m] * self.FRAC_FS_TUNE_GAIN) * self.MIN_FS_PPM_OFFSET
-                            frac_delay_update_flag = True
-                    
-                    if frac_delay_update_flag:
-                        self.logger.debug(f"Sending ppm offsets: {fs_ppm_offsets}")
-                        msg_byte_array = inter_module_messages.pack_msg_sample_freq_tune(self.module_identifier, fs_ppm_offsets)
-                        self.rtl_daq_socket.send(msg_byte_array)
-                        reply = self.rtl_daq_socket.recv()
-                        self.logger.debug(f"Received reply: {reply}")
-                        self.last_update_ind=self.iq_header.cpi_index
-                        self.current_state = "STATE_FRAC_SYNC_WAIT"
-                    else:
+
+                    if monotonic() - self.frac_cal_start_time > self.frac_cal_timeout_s:
+                        # Give up: the residual is a fixed per-power-cycle AD9361
+                        # characteristic (see frac_delay_tolerance's comment above),
+                        # not a drift, so further retries are equally unlikely to
+                        # converge. Accept the current residual and move on instead
+                        # of deadlocking STATE_FRAC_SAMPLE_CAL/STATE_FRAC_SYNC_WAIT
+                        # forever -- this is a deliberate give-up, not a sync failure.
+                        self.logger.warning(f"Fractional sample delay calibration gave up after "
+                                             f"{self.frac_cal_timeout_s:.1f}s, accepting residual taus: {taus}")
+                        self.frac_cal_start_time = None
                         self.current_state = "STATE_IQ_CAL"
+                    else:
+                        # Determine and set tune values
+                        frac_delay_update_flag = False
+                        fs_ppm_offsets=[0]*self.M
+
+                        for m in range(self.M-1):
+                            if abs(taus[m]) > self.frac_delay_tolerance:
+                                fs_ppm_offsets[m+1] = np.sign(taus[m]) * np.abs(taus[m] * self.FRAC_FS_TUNE_GAIN) * self.MIN_FS_PPM_OFFSET
+                                frac_delay_update_flag = True
+
+                        if frac_delay_update_flag:
+                            self.logger.debug(f"Sending ppm offsets: {fs_ppm_offsets}")
+                            msg_byte_array = inter_module_messages.pack_msg_sample_freq_tune(self.module_identifier, fs_ppm_offsets)
+                            self.rtl_daq_socket.send(msg_byte_array)
+                            reply = self.rtl_daq_socket.recv()
+                            self.logger.debug(f"Received reply: {reply}")
+                            self.last_update_ind=self.iq_header.cpi_index
+                            self.current_state = "STATE_FRAC_SYNC_WAIT"
+                        else:
+                            self.frac_cal_start_time = None
+                            self.current_state = "STATE_IQ_CAL"
                 #
                 #------------------------------------------>
                 #
@@ -648,11 +888,19 @@ class delaySynchronizer():
                             iq_sync_flag = False
                             iq_corr_update_flag = False                            
                            
-                        # Check IQ calibration necessity
-                        elif (abs(np.rad2deg(np.angle(iq_diffs[m]))) > self.phase_diff_tolerance) or \
-                             (abs(iq_diffs[m]) > self.amp_diff_tolerance):  
+                        # Check IQ calibration necessity across all channels --
+                        # not just channel m, which by this point is a stale
+                        # leftover from STATE_FRAC_SAMPLE_CAL's own "for m in
+                        # range(self.M-1)" loop several states back (Python
+                        # doesn't scope for-loop variables to the loop). A
+                        # single fixed, arbitrary channel index was being
+                        # checked every cycle instead of scanning all of
+                        # them -- matches STATE_TRACK's equivalent check just
+                        # below, which already uses this any()-based pattern.
+                        elif (np.abs(np.rad2deg(np.angle(iq_diffs))) > self.phase_diff_tolerance).any() or \
+                             (np.abs(iq_diffs) > self.amp_diff_tolerance).any():
                             iq_corr_update_flag = True
-                            self.logger.debug("Amplitude or phase differenceas are out of tolerance")                        
+                            self.logger.debug("Amplitude or phase differenceas are out of tolerance")
                         
                         # Update correction values if needed                
                         if iq_corr_update_flag:
