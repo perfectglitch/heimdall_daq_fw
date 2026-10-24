@@ -169,6 +169,16 @@ def check_ini(parameters, en_hw_check=True):
         if int(daq_params['center_freq']) <= 0:
             error_list.append("DAQ center frequency must be a non-zero integer. Currently it is: '{0}' ".format(daq_params['center_freq']))
 
+    # Optional -- absent (older ini files) means 0 (disabled), same default
+    # as rtl_daq.c's zero-initialized config. 0 = direct R820T2 reception
+    # only; 3/5 = harmonic reception above ~1.766GHz (see
+    # config_files/kraken_default/daq_chain_config.ini's comment).
+    daq_harmonic_str = daq_params.get('harmonic', '0')
+    if not chk_int(daq_harmonic_str):
+        error_list.append("DAQ harmonic must be an integer (0=disabled). Currently it is: '{0}' ".format(daq_harmonic_str))
+    elif int(daq_harmonic_str) < 0:
+        error_list.append("DAQ harmonic must be 0 or positive. Currently it is: '{0}' ".format(daq_harmonic_str))
+
     if not chk_int(daq_params['sample_rate']):
         error_list.append("Sample rate must be a non-zero integer. Currently it is: '{0}' ".format(daq_params['sample_rate']))
     else:

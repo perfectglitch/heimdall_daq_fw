@@ -84,7 +84,7 @@ int gain_change_flag;
 int *new_gains;
 float *new_fs_corrections;
 int fs_correction_flag, fs_reset_cntr;
-uint32_t new_center_freq;
+uint64_t new_center_freq; // see rtl_rec_struct.center_freq's comment (rtl_daq.h)
 int center_freq_change_flag;
 int agc_change_flag = 0;
 static uint32_t ch_no, buffer_size;
@@ -101,10 +101,10 @@ int gpio_24 = 0;
 typedef struct
 {
     int num_ch;
-    char* en_bias_tee_str;    
-    int daq_buffer_size;    
+    char* en_bias_tee_str;
+    int daq_buffer_size;
     int sample_rate;
-    int center_freq;
+    uint64_t center_freq; // see rtl_rec_struct.center_freq's comment (rtl_daq.h)
     int gain;
     int en_noise_source_ctr;
     int ctr_channel_serial_no;
@@ -112,6 +112,7 @@ typedef struct
     const char* hw_name;
     int hw_unit_id;
     int ioo_type;
+    int harmonic; // see rtl_rec_struct.harmonic's comment (rtl_daq.h); 0 if unset in the ini
 } configuration;
 
 /*
@@ -137,8 +138,10 @@ static int handler(void* conf_struct, const char* section, const char* name,
         {pconfig->daq_buffer_size = atoi(value);} 
     else if (MATCH("daq", "sample_rate")) 
         {pconfig->sample_rate = atoi(value);} 
-    else if (MATCH("daq", "center_freq")) 
-        {pconfig->center_freq = atoi(value);} 
+    else if (MATCH("daq", "center_freq"))
+        {pconfig->center_freq = strtoull(value, NULL, 10);} // atoi (32-bit int) would truncate/overflow above ~2.1GHz
+    else if (MATCH("daq", "harmonic"))
+        {pconfig->harmonic = atoi(value);}
     else if (MATCH("daq", "gain")) 
         {pconfig->gain = atoi(value);} 
     else if (MATCH("daq", "en_noise_source_ctr")) 
@@ -201,13 +204,15 @@ void * fifo_read_tf(void* arg)
         {
             log_info("Signal 'r': Reconfiguring the tuner");
             /* center_freq is 8 byte (offset 0), sample_rate/gain are 4 byte
-             * each (offsets 8, 12) -- see pack_msg_reconfiguration(). RTL-SDR
-             * itself only tunes up to ~1.7GHz, but the wire format is shared
-             * with usrp_daq.c, whose frequencies don't fit in 4 bytes (e.g.
-             * 5.8GHz), so this side has to parse the same 8-byte layout even
-             * though it will only ever see small values here. memcpy instead
-             * of a pointer cast: msg->parameters isn't 8-byte aligned within
-             * hdaq_im_msg_struct (2 single-byte fields precede it). */
+             * each (offsets 8, 12) -- see pack_msg_reconfiguration(). Direct
+             * R820T2 reception only tunes up to ~1.766GHz, but harmonic
+             * reception (rtlsdr_set_harmonic_rx(), see rtl_rec_struct's
+             * comment in rtl_daq.h) reaches up to ~6GHz, and the wire
+             * format is shared with usrp_daq.c regardless, so this side
+             * parses the full 8-byte value rather than truncating it.
+             * memcpy instead of a pointer cast: msg->parameters isn't
+             * 8-byte aligned within hdaq_im_msg_struct (2 single-byte
+             * fields precede it). */
             uint64_t freq_u64; memcpy(&freq_u64, msg->parameters, sizeof(freq_u64));
             uint32_t sample_rate_u32; memcpy(&sample_rate_u32, msg->parameters + 8, sizeof(sample_rate_u32));
             uint32_t gain_u32; memcpy(&gain_u32, msg->parameters + 12, sizeof(gain_u32));
@@ -219,7 +224,7 @@ void * fifo_read_tf(void* arg)
             for(int i=0; i<ch_no; i++)
             {
               rtl_receivers[i].gain = (int) gain_u32;
-              rtl_receivers[i].center_freq = (int) freq_u64;
+              rtl_receivers[i].center_freq = freq_u64;
               rtl_receivers[i].sample_rate = sample_rate_u32;
             }
             reconfig_trigger=1;
@@ -230,7 +235,7 @@ void * fifo_read_tf(void* arg)
             log_info("Signal 'c': Center frequency tuning request");
             /* 8 byte, not 4 -- see the 'r' handler's comment above. */
             uint64_t freq_u64; memcpy(&freq_u64, msg->parameters, sizeof(freq_u64));
-            new_center_freq = (uint32_t) freq_u64;
+            new_center_freq = freq_u64;
             center_freq_change_flag = 1;
             log_info("New center frequency: %u MHz", ((unsigned int) (freq_u64/1000000)));
         }
@@ -372,18 +377,30 @@ void *read_thread_entry(void *arg)
     {
         log_error("Failed to disbale AGC: %s", strerror(errno));
     }
-   
+    /* Enable/disable R820T2 harmonic reception (0 = disabled, direct
+     * reception only; 3 or 5 = 3rd/5th-harmonic reception above
+     * ~1.766GHz, up to ~6GHz -- see rtl_rec_struct.harmonic's comment in
+     * rtl_daq.h). Requires krakenrf/librtlsdr (already what
+     * util/install.sh installs) -- an older driver build without
+     * rtlsdr_set_harmonic_rx() will fail this call for any nonzero value. */
+    if (rtl_rec->harmonic != 0 && rtlsdr_set_harmonic_rx(dev, rtl_rec->harmonic) != 0)
+    {
+        log_error("Failed to enable harmonic=%d reception: %s -- is librtlsdr new enough "
+                  "(util/install.sh's krakenrf/librtlsdr) to support rtlsdr_set_harmonic_rx()?",
+                  rtl_rec->harmonic, strerror(errno));
+    }
+
     while(!exit_flag)
     {
-   
+
         //(rtlsdr_set_testmode(dev, 1)); // Set this to enable test mode
-        
+
         /* Set center frequency */
-        if (rtlsdr_set_center_freq(dev, rtl_rec->center_freq) !=0)
+        if (rtlsdr_set_center_freq64(dev, rtl_rec->center_freq) !=0)
         {
             log_error("Failed to set center frequency: %s", strerror(errno));
         }
-        rtl_rec->center_freq = rtlsdr_get_center_freq(rtl_rec->dev);
+        rtl_rec->center_freq = rtlsdr_get_center_freq64(rtl_rec->dev);
 
         /* Set tuner gain */
         if (rtlsdr_set_tuner_gain(dev, rtl_rec->gain) !=0)
@@ -422,7 +439,7 @@ void *read_thread_entry(void *arg)
         if (rtl_rec->dev_ind == 0)
         {
             log_info("Exact sample rate: %d Hz", rtlsdr_get_sample_rate(dev));
-            log_info("Exact center frequency: %d Hz",rtlsdr_get_center_freq(dev));
+            log_info("Exact center frequency: %llu Hz", (unsigned long long) rtlsdr_get_center_freq64(dev));
         }
 
         /* Starting Asychronous read*/
@@ -436,7 +453,10 @@ return NULL;
 int main( int argc, char** argv )
 {   
     log_set_level(LOG_TRACE);
-    configuration config;
+    // Zero-initialized so a new, optional field (harmonic) defaults safely
+    // to 0 (disabled, direct reception only) for existing ini files that
+    // don't set it yet, instead of reading uninitialized stack memory.
+    configuration config = {0};
 
     #ifdef USEPIGPIO
     // PIGPIO
@@ -525,6 +545,7 @@ int main( int argc, char** argv )
         rtl_rec->agc = 0;
         rtl_rec->center_freq = config.center_freq;
         rtl_rec->sample_rate = config.sample_rate;
+        rtl_rec->harmonic = config.harmonic;
         rtl_rec->buffer = malloc(NUM_BUFF * buffer_size * sizeof(uint8_t));      
         if(! rtl_rec->buffer)
         {
@@ -739,15 +760,15 @@ int main( int argc, char** argv )
             {
                 for( int i=0; i<ch_no; i++)
                 {
-                    rtl_rec = &rtl_receivers[i];         
-                    if (rtlsdr_set_center_freq(rtl_rec->dev, new_center_freq) !=0)
+                    rtl_rec = &rtl_receivers[i];
+                    if (rtlsdr_set_center_freq64(rtl_rec->dev, new_center_freq) !=0)
                     {
                         log_error("Failed to set center frequency: %s", strerror(errno));
-                    }                    
+                    }
                     else
                     {
-                        rtl_rec->center_freq = rtlsdr_get_center_freq(rtl_rec->dev);
-                        log_info("Center frequency changed at ch: %d, frequency: %d",i,rtl_rec->center_freq);
+                        rtl_rec->center_freq = rtlsdr_get_center_freq64(rtl_rec->dev);
+                        log_info("Center frequency changed at ch: %d, frequency: %llu",i,(unsigned long long) rtl_rec->center_freq);
                     }
                 }
                 center_freq_change_flag=0;

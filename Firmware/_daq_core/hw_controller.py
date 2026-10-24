@@ -449,6 +449,20 @@ class HWC():
                 # single configured calibration gain instead of cal_gain_table.
                 cal_gain_ind = min(range(len(self.usrp_valid_gains)),
                                     key=lambda i: abs(self.usrp_valid_gains[i] - round(self.usrp_cal_gain_db * 10)))
+            elif self.iq_header.rf_center_freq > self.cal_gain_table[0,-1]:
+                # cal_gain_table only has real, characterized entries up to
+                # 1700MHz (the stock R820T2 range) -- above that (harmonic
+                # reception, see [daq] harmonic in the ini) argmin just picks
+                # the nearest (1700MHz) entry rather than erroring, which is
+                # an unverified extrapolation, not a validated value. Warn
+                # once per calibration attempt so a bad lock at a
+                # harmonic-mixed frequency doesn't get silently blamed on
+                # something else.
+                self.logger.warning(
+                    "Calibration gain for {:.0f}MHz is extrapolated beyond cal_gain_table's "
+                    "characterized range (up to {:.0f}MHz) -- unverified at harmonic-mixed "
+                    "frequencies, may need empirical retuning".format(
+                        self.iq_header.rf_center_freq/1e6, self.cal_gain_table[0,-1]/1e6))
             for m in range(self.M):
                 self.last_gains[m]=self.gains[m]
                 if self.backend == 'usrp':
